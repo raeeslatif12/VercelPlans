@@ -33,5 +33,5 @@ const fillReferralFromUrl = () => { const field = document.querySelector('input[
 const preserveReferral = () => { const referral = referralFromUrl(); if (referral && location.pathname === '/register') history.replaceState({}, '', `/register?ref=${encodeURIComponent(referral)}`); };
 const route = () => { if (location.pathname === '/admin') history.replaceState({}, '', '/admin-dashboard'); return location.pathname; };
 window.addEventListener('popstate', () => { const path = route(); preserveReferral(); if (path === '/admin-dashboard') renderAdmin(); else render().then(fillReferralFromUrl); });
-if (route() === '/admin-dashboard') renderAdmin(); else render().then(() => { preserveReferral(); fillReferralFromUrl(); });
+if (route() === '/admin-dashboard') { if (!window.__adminConsoleBooted) renderAdmin(); } else render().then(() => { preserveReferral(); fillReferralFromUrl(); });
 
