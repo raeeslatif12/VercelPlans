@@ -172,7 +172,7 @@ const auth = async (req, res, next) => {
     const token = req.cookies.vp_token;
     if (!token) return res.status(401).json({ error: 'Please log in.' });
     const payload = jwt.verify(token, jwtSecret);
-    const result = await query('SELECT * FROM users WHERE id = $1', [payload.userId]);
+    const result = await query('SELECT * FROM users WHERE id = $1 AND status = \'active\'', [payload.userId]);
     if (!result.rows[0]) return res.status(401).json({ error: 'Account not found.' });
     req.user = result.rows[0];
     next();
@@ -185,7 +185,7 @@ const adminAuth = async (req, res, next) => {
   try {
     const payload = jwt.verify(req.cookies.vp_admin_token || '', jwtSecret);
     if (!payload.admin) throw new Error('Invalid admin session');
-    const result = await query('SELECT * FROM users WHERE role = \'admin\' AND ($1::integer IS NULL OR id=$1) ORDER BY id LIMIT 1', [payload.userId || null]);
+    const result = await query('SELECT * FROM users WHERE role = \'admin\' AND status = \'active\' AND ($1::integer IS NULL OR id=$1) ORDER BY id LIMIT 1', [payload.userId || null]);
     if (!result.rows[0]) throw new Error('Admin account not found');
     req.admin = result.rows[0];
     next();
@@ -226,6 +226,13 @@ const insertAuditLog = async (actorUserId, targetUserId, action, metadata = {}) 
   );
 };
 
+const insertAuditLogWithClient = async (client, actorUserId, targetUserId, action, metadata = {}) => {
+  await client.query(
+    'INSERT INTO admin_audit_log(actor_user_id, target_user_id, action, metadata) VALUES($1,$2,$3,$4::jsonb)',
+    [actorUserId || null, targetUserId || null, action, JSON.stringify(metadata || {})]
+  );
+};
+
 const createDeviceHash = req => {
   const userAgent = String(req.headers['user-agent'] || '');
   const forwarded = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '');
@@ -250,6 +257,7 @@ const ensureDatabaseSchema = async () => {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(120) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(160) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(12);`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`,
@@ -474,7 +482,7 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const phone = String(req.body.phone || '').trim();
-    const result = await query('SELECT * FROM users WHERE phone = $1', [phone]);
+    const result = await query('SELECT * FROM users WHERE phone = $1 AND status = \'active\'', [phone]);
     if (!result.rows[0] || !(await bcrypt.compare(req.body.password || '', result.rows[0].password_hash))) {
       return res.status(401).json({ error: 'The mobile number or password is incorrect.' });
     }
@@ -809,7 +817,7 @@ app.patch('/api/admin/withdrawals/:id', adminAuth, async (req, res) => {
       await createLedgerEntry(client, withdrawal.user_id, withdrawal.amount, 'debit', 'withdrawal', `withdrawal:${withdrawal.id}`, { withdrawal_id: withdrawal.id, amount: withdrawal.amount, status: 'posted' });
     }
     const updated = await client.query(
-      'UPDATE withdrawals SET status = $1, approved_by = COALESCE($2, approved_by), approved_at = CASE WHEN $1 = \'Approved\' THEN NOW() ELSE approved_at END, rejection_reason = COALESCE($3, rejection_reason) WHERE id = $4 RETURNING *',
+      'UPDATE withdrawals SET status = $1::varchar, approved_by = COALESCE($2, approved_by), approved_at = CASE WHEN $1::varchar = \'Approved\' THEN NOW() ELSE approved_at END, rejection_reason = COALESCE($3, rejection_reason) WHERE id = $4 RETURNING *',
       [nextStatus, req.admin.id, rejectionReason || withdrawal.rejection_reason, req.params.id]
     );
     await client.query('COMMIT');
@@ -870,15 +878,26 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
       return res.status(404).json({ error: 'User not found.' });
     }
     const user = targetUser.rows[0];
+    if (user.status === 'deleted') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Deleted accounts cannot be edited.' });
+    }
+    if (body.status !== undefined && !['active', 'suspended'].includes(String(body.status))) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'User status must be active or suspended.' });
+    }
     const previousBalance = Number(user.balance || 0);
     let nextBalance = previousBalance;
     const salaryAdjusted = Number(body.balanceAdjustment || 0);
     if (Number.isFinite(salaryAdjusted) && salaryAdjusted !== 0) {
       nextBalance += salaryAdjusted;
-      if (nextBalance < 0) return res.status(400).json({ error: 'Balance adjustment cannot make the balance negative.' });
+      if (nextBalance < 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Balance adjustment cannot make the balance negative.' });
+      }
       await client.query('UPDATE users SET balance = $1, updated_at = NOW() WHERE id = $2', [nextBalance, req.params.id]);
       await createLedgerEntry(client, req.params.id, salaryAdjusted, salaryAdjusted > 0 ? 'credit' : 'debit', 'admin_adjustment', `admin_adjustment:${req.params.id}:${Date.now()}`, { previous_balance: previousBalance, new_balance: nextBalance, note: body.balanceReason || 'Admin balance adjustment', admin_id: req.admin.id });
-      await insertAuditLog(req.admin.id, req.params.id, 'balance_adjustment', { amount: salaryAdjusted, previous_balance: previousBalance, new_balance: nextBalance, reason: body.balanceReason || '' });
+      await insertAuditLogWithClient(client, req.admin.id, req.params.id, 'balance_adjustment', { amount: salaryAdjusted, previous_balance: previousBalance, new_balance: nextBalance, reason: body.balanceReason || '' });
     }
     if (body.name !== undefined || body.email !== undefined || body.phone !== undefined || body.status !== undefined) {
       const updates = [];
@@ -892,7 +911,7 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
     }
     if (body.password) {
       await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [await bcrypt.hash(body.password, 12), req.params.id]);
-      await insertAuditLog(req.admin.id, req.params.id, 'password_reset', { by_admin: req.admin.id });
+      await insertAuditLogWithClient(client, req.admin.id, req.params.id, 'password_reset', { by_admin: req.admin.id });
     }
     const refreshed = await client.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
     await client.query('COMMIT');
@@ -912,7 +931,7 @@ app.delete('/api/admin/users/:id', adminAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const target = await client.query('SELECT id, role, phone FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    const target = await client.query('SELECT id, role, phone, name, email, status FROM users WHERE id = $1 FOR UPDATE', [userId]);
     if (!target.rowCount) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'User not found.' });
@@ -921,12 +940,21 @@ app.delete('/api/admin/users/:id', adminAuth, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Admin accounts cannot be deleted here.' });
     }
+    if (target.rows[0].status === 'deleted') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'User is already deleted.' });
+    }
 
-    await client.query('UPDATE users SET referred_by = NULL WHERE referred_by = $1', [userId]);
-    await client.query('DELETE FROM users WHERE id = $1', [userId]);
+    await client.query('UPDATE users SET status = \'deleted\', deleted_at = NOW(), updated_at = NOW() WHERE id = $1', [userId]);
+    await insertAuditLogWithClient(client, req.admin.id, userId, 'user_deleted', {
+      deletion_type: 'soft',
+      user_id: userId,
+      phone: target.rows[0].phone,
+      name: target.rows[0].name || '',
+      email: target.rows[0].email || '',
+    });
     await client.query('COMMIT');
-    await insertAuditLog(req.admin.id, null, 'user_deleted', { deleted_user_id: userId, phone: target.rows[0].phone });
-    res.json({ ok: true });
+    res.json({ ok: true, status: 'deleted' });
   } catch (error) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });

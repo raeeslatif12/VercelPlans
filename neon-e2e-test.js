@@ -38,7 +38,8 @@ try {
   const selfReferral = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.103.${crypto.randomInt(1, 250)}` }, body: JSON.stringify({ phone, password: randomPassword(), referralCode }) });
   assert(selfReferral.response.status === 400 && selfReferral.data.error === 'You cannot use your own referral code.', 'self referral was not rejected');
   const referredPhone = randomPhone();
-  const referred = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.101.${crypto.randomInt(1, 250)}` }, body: JSON.stringify({ phone: referredPhone, password: randomPassword(), referralCode }) });
+  const referredPassword = randomPassword();
+  const referred = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.101.${crypto.randomInt(1, 250)}` }, body: JSON.stringify({ phone: referredPhone, password: referredPassword, referralCode }) });
   assert(referred.response.status === 201, 'referred registration failed');
   secondUserId = referred.data.user.id;
   assert(referred.data.user.referralCode && referred.data.user.referralCode !== referralCode, 'users did not receive distinct referral codes');
@@ -110,14 +111,19 @@ try {
   withdrawalId = (await pool.query('SELECT id FROM withdrawals WHERE user_id=$1 ORDER BY id DESC LIMIT 1', [userId])).rows[0].id;
   const adminWithdrawals = await request('/api/admin/withdrawals', {}, adminCookie);
   assert(adminWithdrawals.data.withdrawals.some(item => item.id === withdrawalId), 'admin withdrawal list failed');
-  await patch(`/api/admin/withdrawals/${withdrawalId}`, { status: 'Processing' }, adminCookie);
+  const processed = await patch(`/api/admin/withdrawals/${withdrawalId}`, { status: 'Processing' }, adminCookie);
+  assert(processed.response.ok, `admin withdrawal update failed (${processed.response.status}): ${processed.data.error || 'unknown error'}`);
   const userWithdrawals = await request('/api/withdrawals', {}, userCookie);
   const processedWithdrawal = userWithdrawals.data.withdrawals.find(item => item.id === withdrawalId);
-  assert(processedWithdrawal && processedWithdrawal.status === 'Processing', 'withdrawal status did not update');
+  assert(processedWithdrawal && String(processedWithdrawal.status).toLowerCase() === 'processing', `withdrawal status did not update (${JSON.stringify(processedWithdrawal || null)})`);
   const methods = await request('/api/admin/payment-methods', {}, adminCookie);
   assert(methods.data.methods.length > 0, 'admin payment methods failed');
   const normalAdminAttempt = await request('/api/admin/orders', {}, userCookie);
   assert([401, 403].includes(normalAdminAttempt.response.status), 'normal user reached admin API');
+  const normalDeleteAttempt = await request(`/api/admin/users/${secondUserId}`, { method: 'DELETE' }, referred.cookie);
+  assert([401, 403].includes(normalDeleteAttempt.response.status), 'normal user reached admin deletion API');
+  const editedUser = await patch(`/api/admin/users/${secondUserId}`, { name: 'E2E Managed User', email: 'e2e-managed@example.invalid' }, adminCookie);
+  assert(editedUser.response.ok && editedUser.data.user.name === 'E2E Managed User', 'admin user edit failed');
 
   const tempPlan = await post('/api/admin/plans', { name: `E2E ${Date.now()}`, investment: 1234, dailyReturn: 50, durationDays: 30, totalReturn: 1500, description: 'Temporary test plan' }, adminCookie);
   assert(tempPlan.response.status === 201, 'admin plan creation failed');
@@ -126,6 +132,13 @@ try {
   const tempMethod = await post('/api/admin/payment-methods', { name: `E2E Method ${Date.now()}`, details: 'Temporary test method' }, adminCookie);
   assert(tempMethod.response.status === 201, 'admin payment method creation failed');
   tempMethodId = tempMethod.data.method.id;
+  const deletedUser = await request(`/api/admin/users/${secondUserId}`, { method: 'DELETE' }, adminCookie);
+  assert(deletedUser.response.ok && deletedUser.data.status === 'deleted', 'admin soft deletion failed');
+  const deletedRow = (await pool.query('SELECT status,deleted_at FROM users WHERE id=$1', [secondUserId])).rows[0];
+  const deleteAudit = (await pool.query("SELECT action,metadata FROM admin_audit_log WHERE target_user_id=$1 AND action='user_deleted' ORDER BY id DESC LIMIT 1", [secondUserId])).rows[0];
+  assert(deletedRow.status === 'deleted' && deletedRow.deleted_at && deleteAudit?.metadata?.deletion_type === 'soft', 'deleted user or audit snapshot was not retained');
+  const deletedLogin = await post('/api/login', { phone: referredPhone, password: referredPassword });
+  assert(deletedLogin.response.status === 401, 'soft-deleted user was still able to log in');
   console.log('NEON_E2E_PASS');
 } catch (error) {
   console.error(`NEON_E2E_FAIL: ${error.message}`);
