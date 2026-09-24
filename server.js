@@ -48,11 +48,27 @@ app.use((req, res, next) => {
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
-const allowedOrigins = new Set([process.env.APP_ORIGIN, process.env.VERCEL_URL && `https://${process.env.VERCEL_URL}`].filter(Boolean));
+const normalizeOrigin = value => {
+  try {
+    const parsed = new URL(String(value || '').trim());
+    return `${parsed.protocol}//${parsed.host}`;
+  } catch {
+    return '';
+  }
+};
+const requestOrigin = req => {
+  const protocol = String(req.get('x-forwarded-proto') || req.protocol || '').split(',')[0].trim();
+  const host = String(req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+  return normalizeOrigin(`${protocol}://${host}`);
+};
+const allowedOrigins = new Set([
+  normalizeOrigin(process.env.APP_ORIGIN),
+  normalizeOrigin(process.env.VERCEL_URL && `https://${process.env.VERCEL_URL}`),
+].filter(Boolean));
 const originGuard = (req, res, next) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
-  const origin = req.get('origin');
-  if (origin && !allowedOrigins.has(origin) && origin !== `${req.protocol}://${req.get('host')}`) return res.status(403).json({ error: 'Cross-origin request rejected.' });
+  const origin = normalizeOrigin(req.get('origin'));
+  if (origin && !allowedOrigins.has(origin) && origin !== requestOrigin(req)) return res.status(403).json({ error: 'Cross-origin request rejected.' });
   next();
 };
 app.use(originGuard);
