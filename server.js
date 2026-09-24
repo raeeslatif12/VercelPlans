@@ -73,6 +73,15 @@ const readAllSettings = async () => {
   return settings;
 };
 
+const normalizeNamePart = value => String(value || '').trim().replace(/\s+/g, ' ');
+const fullNameFor = row => [normalizeNamePart(row.first_name), normalizeNamePart(row.last_name)].filter(Boolean).join(' ') || normalizeNamePart(row.name) || 'VercelPlans member';
+const initialsFor = row => {
+  const first = normalizeNamePart(row.first_name);
+  const last = normalizeNamePart(row.last_name);
+  if (first && last) return `${first[0]}${last[0]}`.toUpperCase();
+  const parts = fullNameFor(row).split(/\s+/).filter(Boolean);
+  return (parts.length > 1 ? `${parts[0][0]}${parts[parts.length - 1][0]}` : parts[0]?.slice(0, 2) || 'VP').toUpperCase();
+};
 const safeUser = row => ({
   id: row.id,
   phone: row.phone,
@@ -82,7 +91,11 @@ const safeUser = row => ({
   totalReviews: row.total_reviews,
   totalReferrals: row.total_referrals,
   referralEarnings: row.referral_earnings,
-  name: row.name || '',
+  firstName: normalizeNamePart(row.first_name),
+  lastName: normalizeNamePart(row.last_name),
+  name: fullNameFor(row),
+  fullName: fullNameFor(row),
+  avatarInitials: initialsFor(row),
   email: row.email || '',
   status: row.status || 'active',
 });
@@ -257,6 +270,8 @@ const ensureDatabaseSchema = async () => {
   const statements = [
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'user';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(120) NOT NULL DEFAULT '';`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(80) NOT NULL DEFAULT '';`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(80) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(160) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;`,
@@ -303,6 +318,13 @@ const ensureDatabaseSchema = async () => {
         throw error;
       }
     }
+  }
+
+  const legacyNames = await query("SELECT id, name FROM users WHERE (first_name = '' OR last_name = '') AND name <> ''");
+  for (const user of legacyNames.rows) {
+    const parts = normalizeNamePart(user.name).split(' ').filter(Boolean);
+    if (!parts.length) continue;
+    await query('UPDATE users SET first_name = CASE WHEN first_name = \'\' THEN $1 ELSE first_name END, last_name = CASE WHEN last_name = \'\' THEN $2 ELSE last_name END, updated_at = NOW() WHERE id = $3', [parts[0], parts.slice(1).join(' '), user.id]);
   }
 
   const usersWithoutCodes = await query("SELECT id FROM users WHERE referral_code IS NULL OR referral_code = '' ORDER BY id");
@@ -429,7 +451,12 @@ app.get('/api/dashboard', auth, async (req, res) => {
 app.post('/api/register', async (req, res) => {
   const client = pool?.connect ? await pool.connect() : null;
   try {
+    const firstName = normalizeNamePart(req.body.firstName);
+    const lastName = normalizeNamePart(req.body.lastName);
     const { phone, password, referralCode } = req.body;
+    if (!firstName || !lastName || firstName.length > 80 || lastName.length > 80) {
+      return res.status(400).json({ error: 'First name and last name are required and must be 80 characters or fewer.' });
+    }
     if (!/^03\d{9}$/.test(String(phone || '')) || String(password || '').length < 7) {
       return res.status(400).json({ error: 'Enter a valid mobile number and a password of at least 7 characters.' });
     }
@@ -472,8 +499,8 @@ app.post('/api/register', async (req, res) => {
     for (;;) {
       try {
         created = await db.query(
-          'INSERT INTO users(phone,password_hash,referral_code,referred_by) VALUES($1,$2,$3,$4) RETURNING *',
-          [phone, await bcrypt.hash(password, 12), generateReferralCode(), referrer?.id || null]
+          'INSERT INTO users(phone,password_hash,referral_code,referred_by,name,first_name,last_name) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+          [phone, await bcrypt.hash(password, 12), generateReferralCode(), referrer?.id || null, `${firstName} ${lastName}`, firstName, lastName]
         );
         break;
       } catch (error) {
@@ -563,7 +590,7 @@ app.post('/api/admin/password', adminAuth, async (req, res) => {
 
 app.get('/api/referrals', auth, async (req, res) => {
   const result = await query(
-    'SELECT rr.id, rr.reward_amount, rr.status, rr.qualified_at, rr.created_at, u.phone AS referred_phone FROM referral_rewards rr JOIN users u ON u.id = rr.referred_user_id WHERE rr.referrer_user_id = $1 ORDER BY rr.created_at DESC',
+    'SELECT rr.id, rr.reward_amount, rr.status, rr.qualified_at, rr.created_at, COALESCE(NULLIF(CONCAT_WS(\' \', u.first_name, u.last_name), \'\'), u.name, u.phone) AS referred_phone, u.phone AS referred_mobile, u.first_name AS referred_first_name, u.last_name AS referred_last_name, u.name AS referred_name FROM referral_rewards rr JOIN users u ON u.id = rr.referred_user_id WHERE rr.referrer_user_id = $1 ORDER BY rr.created_at DESC',
     [req.user.id]
   );
   const summary = (await query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status IN ('qualified','rewarded','credited'))::int AS approved, COUNT(*) FILTER (WHERE status = 'registered')::int AS pending, COALESCE(SUM(CASE WHEN status IN ('qualified','rewarded','credited') THEN reward_amount ELSE 0 END),0) AS earnings FROM referral_rewards WHERE referrer_user_id = $1`, [req.user.id])).rows[0];
@@ -799,7 +826,7 @@ app.delete('/api/admin/plans/:id', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/orders', adminAuth, async (req, res) => {
-  const orders = await query('SELECT o.*, u.id user_id, u.phone, u.created_at user_created_at, u.balance user_balance, p.name plan_name, pm.name payment_method FROM orders o JOIN users u ON u.id = o.user_id JOIN plans p ON p.id = o.plan_id LEFT JOIN payment_methods pm ON pm.id = o.payment_method_id ORDER BY o.created_at DESC');
+  const orders = await query('SELECT o.*, u.id user_id, COALESCE(NULLIF(CONCAT_WS(\' \', u.first_name, u.last_name), \'\'), u.name, u.phone) AS phone, u.phone AS mobile, u.created_at user_created_at, u.balance user_balance, p.name plan_name, pm.name payment_method FROM orders o JOIN users u ON u.id = o.user_id JOIN plans p ON p.id = o.plan_id LEFT JOIN payment_methods pm ON pm.id = o.payment_method_id ORDER BY o.created_at DESC');
   res.json({ orders: orders.rows });
 });
 
@@ -848,7 +875,7 @@ app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/withdrawals', adminAuth, async (req, res) => {
-  const withdrawals = await query('SELECT w.*, u.phone FROM withdrawals w JOIN users u ON u.id = w.user_id ORDER BY w.created_at DESC');
+  const withdrawals = await query('SELECT w.*, COALESCE(NULLIF(CONCAT_WS(\' \', u.first_name, u.last_name), \'\'), u.name, u.phone) AS phone, u.phone AS mobile FROM withdrawals w JOIN users u ON u.id = w.user_id ORDER BY w.created_at DESC');
   res.json({ withdrawals: withdrawals.rows });
 });
 
@@ -906,8 +933,8 @@ app.delete('/api/admin/payment-methods/:id', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/users', adminAuth, async (req, res) => {
-  const users = await query(`SELECT u.id, u.phone, u.role, u.balance, u.total_reviews, u.total_referrals, u.referral_earnings, u.referred_by, u.created_at, u.status, u.name, u.email, u.referral_code, COUNT(DISTINCT ud.id)::int AS device_count, COUNT(DISTINCT o.id) FILTER (WHERE o.status = 'Approved' AND o.active = true)::int AS active_plan_count FROM users u LEFT JOIN user_devices ud ON ud.user_id = u.id LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id ORDER BY u.created_at DESC`);
-  res.json({ users: users.rows });
+  const users = await query(`SELECT u.id, u.phone, u.role, u.balance, u.total_reviews, u.total_referrals, u.referral_earnings, u.referred_by, u.created_at, u.status, u.name, u.first_name, u.last_name, u.email, u.referral_code, COUNT(DISTINCT ud.id)::int AS device_count, COUNT(DISTINCT o.id) FILTER (WHERE o.status = 'Approved' AND o.active = true)::int AS active_plan_count FROM users u LEFT JOIN user_devices ud ON ud.user_id = u.id LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id ORDER BY u.created_at DESC`);
+  res.json({ users: users.rows.map(row => ({ ...row, ...safeUser(row) })) });
 });
 
 app.get('/api/admin/devices', adminAuth, async (req, res) => {
@@ -926,10 +953,13 @@ app.get('/api/admin/devices', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/users', adminAuth, async (req, res) => {
-  const { phone, password, email = '', name = '', status = 'active', deviceHash = '' } = req.body || {};
-  if (!/^03\d{9}$/.test(String(phone || '')) || String(password || '').length < 7) {
+  const firstName = normalizeNamePart(req.body.firstName || req.body.name?.split(/\s+/)[0]);
+  const lastName = normalizeNamePart(req.body.lastName || req.body.name?.split(/\s+/).slice(1).join(' '));
+  const { phone, password, email = '', status = 'active', deviceHash = '' } = req.body || {};
+  if (!firstName || !lastName || firstName.length > 80 || lastName.length > 80 || !/^03\d{9}$/.test(String(phone || '')) || String(password || '').length < 7) {
     return res.status(400).json({ error: 'Enter a valid mobile number and a password of at least 7 characters.' });
   }
+  if (String(email || '').trim() && !/^\S+@\S+\.\S+$/.test(String(email).trim())) return res.status(400).json({ error: 'Enter a valid email address or leave the email blank.' });
   if (!['active', 'suspended'].includes(String(status))) return res.status(400).json({ error: 'Invalid account status.' });
   const client = await pool.connect();
   try {
@@ -947,7 +977,7 @@ app.post('/api/admin/users', adminAuth, async (req, res) => {
     let created;
     for (;;) {
       try {
-        created = await client.query('INSERT INTO users(phone,password_hash,referral_code,role,email,name,status) VALUES($1,$2,$3,\'user\',$4,$5,$6) RETURNING *', [String(phone), await bcrypt.hash(password, 12), generateReferralCode(), String(email || '').trim(), String(name || '').trim(), status]);
+        created = await client.query('INSERT INTO users(phone,password_hash,referral_code,role,email,name,first_name,last_name,status) VALUES($1,$2,$3,\'user\',$4,$5,$6,$7,$8) RETURNING *', [String(phone), await bcrypt.hash(password, 12), generateReferralCode(), String(email || '').trim(), `${firstName} ${lastName}`.trim(), firstName, lastName, status]);
         break;
       } catch (error) {
         if (error.code !== '23505' || !String(error.detail || '').includes('referral_code')) throw error;
@@ -1039,6 +1069,18 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'User status must be active or suspended.' });
     }
+    if (body.firstName !== undefined && !normalizeNamePart(body.firstName)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'First name cannot be empty.' });
+    }
+    if (body.lastName !== undefined && !normalizeNamePart(body.lastName)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Last name cannot be empty.' });
+    }
+    if (body.email !== undefined && String(body.email || '').trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(body.email).trim())) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Enter a valid email address or leave the email blank.' });
+    }
     if (body.phone !== undefined || (body.email !== undefined && String(body.email || '').trim())) {
       const duplicate = await client.query('SELECT id FROM users WHERE id <> $1 AND (($2::varchar IS NOT NULL AND phone = $2::varchar) OR ($3::varchar <> \'\' AND LOWER(email) = LOWER($3::varchar))) LIMIT 1', [req.params.id, body.phone === undefined ? null : String(body.phone).trim(), body.email === undefined ? '' : String(body.email).trim()]);
       if (duplicate.rowCount) {
@@ -1059,17 +1101,28 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
       await createLedgerEntry(client, req.params.id, salaryAdjusted, salaryAdjusted > 0 ? 'credit' : 'debit', 'admin_adjustment', `admin_adjustment:${req.params.id}:${Date.now()}`, { previous_balance: previousBalance, new_balance: nextBalance, note: body.balanceReason || 'Admin balance adjustment', admin_id: req.admin.id });
       await insertAuditLogWithClient(client, req.admin.id, req.params.id, 'balance_adjustment', { amount: salaryAdjusted, previous_balance: previousBalance, new_balance: nextBalance, reason: body.balanceReason || '' });
     }
-    if (body.name !== undefined || body.email !== undefined || body.phone !== undefined || body.status !== undefined) {
+    if (body.name !== undefined || body.firstName !== undefined || body.lastName !== undefined || body.email !== undefined || body.phone !== undefined || body.status !== undefined) {
       const updates = [];
       const values = [];
-      if (body.name !== undefined) { updates.push('name = $' + (values.length + 1)); values.push(String(body.name || '')); }
+      let nextFirstName = body.firstName === undefined ? normalizeNamePart(user.first_name) : normalizeNamePart(body.firstName);
+      let nextLastName = body.lastName === undefined ? normalizeNamePart(user.last_name) : normalizeNamePart(body.lastName);
+      if (body.name !== undefined && body.firstName === undefined && body.lastName === undefined) {
+        const legacyParts = normalizeNamePart(body.name).split(' ').filter(Boolean);
+        nextFirstName = legacyParts[0] || '';
+        nextLastName = legacyParts.slice(1).join(' ');
+      }
+      if (body.firstName !== undefined || body.lastName !== undefined || body.name !== undefined) {
+        updates.push('first_name = $' + (values.length + 1)); values.push(nextFirstName);
+        updates.push('last_name = $' + (values.length + 1)); values.push(nextLastName);
+        updates.push('name = $' + (values.length + 1)); values.push(`${nextFirstName} ${nextLastName}`.trim());
+      }
       if (body.email !== undefined) { updates.push('email = $' + (values.length + 1)); values.push(String(body.email || '')); }
       if (body.phone !== undefined) { updates.push('phone = $' + (values.length + 1)); values.push(String(body.phone || '')); }
       if (body.status !== undefined) { updates.push('status = $' + (values.length + 1)); values.push(String(body.status || 'active')); }
       values.push(req.params.id);
       await client.query(`UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${values.length} RETURNING *`, values);
       await insertAuditLogWithClient(client, req.admin.id, req.params.id, 'user_profile_updated', {
-        fields: ['name', 'email', 'phone', 'status'].filter(field => body[field] !== undefined),
+        fields: ['first_name', 'last_name', 'email', 'phone', 'status'].filter(field => body[field === 'first_name' ? 'firstName' : field === 'last_name' ? 'lastName' : field] !== undefined || (field === 'first_name' && body.name !== undefined)),
         status: body.status,
       });
     }
