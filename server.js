@@ -91,8 +91,12 @@ app.post('/api/admin/login', async (req, res) => {
     const configuredEmail = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
     const configuredPhone = String(process.env.ADMIN_PHONE || '').trim();
     if (!identifier || (identifier !== configuredEmail && identifier !== configuredPhone)) return res.status(401).json({ error: 'Invalid admin credentials.' });
-    const result = await query('SELECT * FROM users WHERE role=\'admin\' AND phone=$1', [configuredPhone]);
-    if (!result.rows[0] || !(await bcrypt.compare(req.body.password || '', result.rows[0].password_hash))) return res.status(401).json({ error: 'Invalid admin credentials.' });
+    const result = await query('SELECT * FROM users WHERE role=\'admin\' ORDER BY id');
+    let admin;
+    for (const row of result.rows) {
+      if (await bcrypt.compare(req.body.password || '', row.password_hash)) { admin = row; break; }
+    }
+    if (!admin) return res.status(401).json({ error: 'Invalid admin credentials.' });
     issueAdminAuth(res);
     res.json({ ok: true });
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
