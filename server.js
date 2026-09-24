@@ -272,6 +272,8 @@ const ensureDatabaseSchema = async () => {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(120) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(80) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(80) NOT NULL DEFAULT '';`,
+    `ALTER TABLE users DROP CONSTRAINT IF EXISTS users_phone_key;`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_active_unique ON users(phone) WHERE status <> 'deleted';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(160) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;`,
@@ -489,7 +491,7 @@ app.post('/api/register', async (req, res) => {
       }
     }
 
-    const existing = await db.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    const existing = await db.query("SELECT id FROM users WHERE phone = $1 AND status <> 'deleted'", [phone]);
     if (existing.rows[0]) {
       if (client) await client.query('ROLLBACK');
       return res.status(409).json({ error: 'This mobile number is already registered.' });
@@ -964,7 +966,7 @@ app.post('/api/admin/users', adminAuth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const duplicate = await client.query('SELECT id FROM users WHERE phone = $1 OR ($2 <> \'\' AND LOWER(email) = LOWER($2)) LIMIT 1', [String(phone), String(email || '')]);
+    const duplicate = await client.query("SELECT id FROM users WHERE status <> 'deleted' AND (phone = $1 OR ($2 <> '' AND LOWER(email) = LOWER($2))) LIMIT 1", [String(phone), String(email || '')]);
     if (duplicate.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'That mobile number or email is already registered.' }); }
     if (deviceHash) {
       const settings = await readAllSettings();
@@ -1225,7 +1227,7 @@ app.post('/api/cron/daily-profit', async (req, res) => {
 
 const ensureAdmin = async () => {
   if (!pool || !process.env.ADMIN_PHONE || !process.env.ADMIN_PASSWORD) return;
-  const existing = await query('SELECT id FROM users WHERE phone = $1', [process.env.ADMIN_PHONE]);
+  const existing = await query("SELECT id FROM users WHERE phone = $1 AND status <> 'deleted'", [process.env.ADMIN_PHONE]);
   if (existing.rows[0]) {
     await query('UPDATE users SET role = \'admin\', email = COALESCE(email, $1), name = COALESCE(name, \'Administrator\'), updated_at = NOW() WHERE id = $2', [process.env.ADMIN_EMAIL || 'admin@vercelplans.app', existing.rows[0].id]);
     return;

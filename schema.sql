@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS users (
   id SERIAL PRIMARY KEY,
-  phone VARCHAR(20) UNIQUE NOT NULL,
+  phone VARCHAR(20) NOT NULL,
   password_hash TEXT NOT NULL,
   referral_code VARCHAR(12) UNIQUE NOT NULL,
   referred_by INTEGER REFERENCES users(id),
@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_active_unique ON users(phone) WHERE status <> 'deleted';
 
 CREATE TABLE IF NOT EXISTS daily_tasks (
   id SERIAL PRIMARY KEY,
