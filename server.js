@@ -945,14 +945,59 @@ app.post('/api/admin/users', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
-  const user = await query('SELECT * FROM users WHERE id = $1', [req.params.id]);
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId)) return res.status(400).json({ error: 'Invalid user.' });
+  const user = await query('SELECT * FROM users WHERE id = $1', [userId]);
   if (!user.rows[0]) return res.status(404).json({ error: 'User not found.' });
-  const orders = await query('SELECT o.*, p.name plan_name FROM orders o JOIN plans p ON p.id = o.plan_id WHERE o.user_id = $1 ORDER BY o.created_at DESC', [req.params.id]);
-  const withdrawals = await query('SELECT * FROM withdrawals WHERE user_id = $1 ORDER BY created_at DESC', [req.params.id]);
-  const tasks = await query('SELECT * FROM daily_task_assignments WHERE user_id = $1 ORDER BY task_date DESC', [req.params.id]);
-  const referrals = await query('SELECT * FROM referral_rewards WHERE referrer_user_id = $1 ORDER BY created_at DESC', [req.params.id]);
-  const ledger = await query('SELECT * FROM ledger_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [req.params.id]);
-  res.json({ user: safeUser(user.rows[0]), orders: orders.rows, withdrawals: withdrawals.rows, tasks, referrals, ledger });
+
+  const [orders, withdrawals, tasks, referrals, referredBy, ledger, devices, audit] = await Promise.all([
+    query(`SELECT o.*, p.name AS plan_name, p.return_rate, p.daily_return, p.duration_days, p.total_return,
+      pm.name AS payment_method, COALESCE((SELECT SUM(profit_amount) FROM plan_daily_profits pp WHERE pp.order_id = o.id AND pp.status = 'posted'), 0)::int AS total_earned
+      FROM orders o JOIN plans p ON p.id = o.plan_id LEFT JOIN payment_methods pm ON pm.id = o.payment_method_id
+      WHERE o.user_id = $1 ORDER BY o.created_at DESC`, [userId]),
+    query('SELECT * FROM withdrawals WHERE user_id = $1 ORDER BY created_at DESC', [userId]),
+    query('SELECT * FROM daily_task_assignments WHERE user_id = $1 ORDER BY task_date DESC, id DESC', [userId]),
+    query(`SELECT rr.*, u.id AS referred_user_id, u.name AS referred_name, u.phone AS referred_phone, u.email AS referred_email, u.status AS referred_status
+      FROM referral_rewards rr JOIN users u ON u.id = rr.referred_user_id
+      WHERE rr.referrer_user_id = $1 ORDER BY rr.created_at DESC`, [userId]),
+    query(`SELECT rr.*, u.id AS referrer_user_id, u.name AS referrer_name, u.phone AS referrer_phone, u.email AS referrer_email
+      FROM referral_rewards rr JOIN users u ON u.id = rr.referrer_user_id WHERE rr.referred_user_id = $1 LIMIT 1`, [userId]),
+    query('SELECT * FROM ledger_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100', [userId]),
+    query('SELECT ud.*, COALESCE(de.allowed, false) AS exception_allowed, COALESCE(de.reason, \'\') AS exception_reason FROM user_devices ud LEFT JOIN device_exceptions de ON de.device_hash = ud.device_hash WHERE ud.user_id = $1 ORDER BY ud.created_at DESC', [userId]),
+    query('SELECT id, actor_user_id, target_user_id, action, metadata, created_at FROM admin_audit_log WHERE target_user_id = $1 ORDER BY created_at DESC LIMIT 100', [userId]),
+  ]);
+
+  const now = Date.now();
+  const planRows = orders.rows.map(order => {
+    const start = order.activated_at || order.created_at;
+    const duration = Number(order.duration_days || 0);
+    const startTime = new Date(start).getTime();
+    const completed = order.status === 'Approved' && order.active ? Math.max(0, Math.min(duration, Math.floor((now - startTime) / 86400000))) : 0;
+    const remaining = order.status === 'Approved' && order.active ? Math.max(0, duration - completed) : 0;
+    const expired = order.status === 'Approved' && order.active && remaining === 0 && duration > 0;
+    return { ...order, rate: Number(order.return_rate || 0), daily_profit: Number(order.daily_return || 0), total_earned: Number(order.total_earned || 0), days_completed: completed, days_remaining: remaining, start_date: start, end_date: new Date(startTime + duration * 86400000).toISOString(), display_status: expired ? 'Expired' : order.status === 'Approved' && order.active ? 'Active' : order.status };
+  });
+  const referralSummary = {
+    total: referrals.rowCount,
+    approved: referrals.rows.filter(row => ['qualified', 'rewarded', 'credited'].includes(row.status)).length,
+    pending: referrals.rows.filter(row => !['qualified', 'rewarded', 'credited'].includes(row.status)).length,
+    earnings: referrals.rows.filter(row => ['rewarded', 'credited'].includes(row.status)).reduce((sum, row) => sum + Number(row.reward_amount || 0), 0),
+  };
+  const totalEarned = ledger.rows.filter(row => row.type === 'credit' && row.status === 'posted').reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const totalWithdrawals = withdrawals.rows.filter(row => ['approved', 'Approved', 'processing', 'completed'].includes(row.status)).reduce((sum, row) => sum + Number(row.amount || 0), 0);
+  const activity = [
+    { type: 'Registration', date: user.rows[0].created_at, detail: 'Account registered' },
+    ...audit.rows.map(row => ({ type: row.action, date: row.created_at, detail: row.metadata?.note || row.metadata?.reason || '', metadata: row.metadata })),
+    ...orders.rows.map(row => ({ type: 'Plan order', date: row.created_at, detail: `${row.plan_name} · ${row.status}`, metadata: { order_id: row.id } })),
+    ...withdrawals.rows.map(row => ({ type: 'Withdrawal request', date: row.created_at, detail: `${row.status} · ${row.amount}`, metadata: { withdrawal_id: row.id } })),
+    ...ledger.rows.map(row => ({ type: row.source || 'Ledger entry', date: row.created_at, detail: `${row.type} · ${row.amount}`, metadata: row.metadata })),
+  ].sort((a, b) => new Date(b.date) - new Date(a.date));
+  const detailUser = { ...safeUser(user.rows[0]), created_at: user.rows[0].created_at, updated_at: user.rows[0].updated_at, last_login_at: user.rows[0].last_login_at, referred_by: user.rows[0].referred_by };
+  res.json({
+    user: detailUser,
+    summary: { balance: Number(user.rows[0].balance || 0), total_earned: totalEarned, active_plan: planRows.find(row => row.display_status === 'Active')?.plan_name || 'No active plan', daily_profit: planRows.filter(row => row.display_status === 'Active').reduce((sum, row) => sum + Number(row.daily_profit || 0), 0), total_referrals: referralSummary.total, approved_referrals: referralSummary.approved, pending_referrals: referralSummary.pending, referral_earnings: referralSummary.earnings, total_orders: orders.rowCount, total_withdrawals: totalWithdrawals, account_status: user.rows[0].status },
+    plans: planRows, orders: orders.rows, withdrawals: withdrawals.rows, tasks: tasks.rows, referrals: referrals.rows, referredBy: referredBy.rows[0] || null, referralSummary, ledger: ledger.rows, devices: devices.rows, activity,
+  });
 });
 
 app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
@@ -1003,6 +1048,10 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
       if (body.status !== undefined) { updates.push('status = $' + (values.length + 1)); values.push(String(body.status || 'active')); }
       values.push(req.params.id);
       await client.query(`UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${values.length} RETURNING *`, values);
+      await insertAuditLogWithClient(client, req.admin.id, req.params.id, 'user_profile_updated', {
+        fields: ['name', 'email', 'phone', 'status'].filter(field => body[field] !== undefined),
+        status: body.status,
+      });
     }
     if (body.password) {
       await client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [await bcrypt.hash(body.password, 12), req.params.id]);
