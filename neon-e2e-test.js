@@ -26,7 +26,7 @@ try {
   const phone = randomPhone();
   const password = randomPassword();
   const registered = await post('/api/register', { phone, password });
-  assert(registered.response.status === 201, 'registration failed');
+  assert(registered.response.status === 201, `registration failed (${registered.response.status}): ${registered.data.error || 'no error returned'}`);
   userId = registered.data.user.id;
   let userCookie = registered.cookie;
   const session = await request('/api/session', {}, userCookie);
