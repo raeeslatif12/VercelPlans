@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_active_unique ON users(phone) WHERE status <> 'deleted';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_active_unique ON users (lower(trim(email))) WHERE status <> 'deleted' AND NULLIF(trim(email), '') IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS daily_tasks (
   id SERIAL PRIMARY KEY,
@@ -43,6 +44,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
   rejection_reason TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_user_pending_unique ON withdrawals(user_id) WHERE status IN ('pending', 'Processing');
 
 CREATE TABLE IF NOT EXISTS plans (
   id SERIAL PRIMARY KEY,
@@ -189,6 +191,7 @@ ON CONFLICT (name) DO NOTHING;
 INSERT INTO app_settings(setting_name, setting_value)
 VALUES
   ('referral_reward_amount', '80'),
+  ('account_creation_reward_amount', '0'),
   ('referral_system_enabled', 'true'),
   ('minimum_withdrawal_amount', '500'),
   ('withdrawal_system_enabled', 'true'),

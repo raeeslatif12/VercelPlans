@@ -6,6 +6,7 @@ const base = process.env.BASE_URL || `http://localhost:${process.env.PORT || 300
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const randomPhone = () => `03${crypto.randomInt(100000000, 999999999)}`;
 const randomPassword = () => `${crypto.randomBytes(18).toString('base64url')}Aa1!`;
+const registrationBody = (phone, password, extra = {}) => ({ phone, password, firstName: 'Neon', lastName: 'Tester', ...extra });
 const request = async (path, options = {}, cookie = '') => {
   const response = await fetch(`${base}${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}), ...(options.headers || {}) } });
   const data = await response.json().catch(() => ({}));
@@ -34,21 +35,21 @@ try {
   const phone = randomPhone();
   const password = randomPassword();
   const testDeviceIp = `198.51.100.${crypto.randomInt(1, 250)}`;
-  const registered = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone, password }) });
+  const registered = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify(registrationBody(phone, password)) });
   assert(registered.response.status === 201, `registration failed (${registered.response.status}): ${registered.data.error || 'no error returned'}`);
   userId = registered.data.user.id;
   let userCookie = registered.cookie;
-  const blockedSameDevice = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword() }) });
+  const blockedSameDevice = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify(registrationBody(randomPhone(), randomPassword())) });
   assert(blockedSameDevice.response.status === 409, 'same-device registration bypassed the default limit');
   const referralCode = registered.data.user.referralCode;
   assert(/^[A-F0-9]{8}$/.test(referralCode), `invalid referral code format: ${referralCode}`);
-  const invalidReferral = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.102.${crypto.randomInt(1, 250)}` }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword(), referralCode: 'INVALID1' }) });
+  const invalidReferral = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.102.${crypto.randomInt(1, 250)}` }, body: JSON.stringify(registrationBody(randomPhone(), randomPassword(), { referralCode: 'INVALID1' })) });
   assert(invalidReferral.response.status === 400 && invalidReferral.data.error === 'Invalid referral code.', 'invalid referral code was accepted');
-  const selfReferral = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.103.${crypto.randomInt(1, 250)}` }, body: JSON.stringify({ phone, password: randomPassword(), referralCode }) });
+  const selfReferral = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.103.${crypto.randomInt(1, 250)}` }, body: JSON.stringify(registrationBody(phone, randomPassword(), { referralCode })) });
   assert(selfReferral.response.status === 400 && selfReferral.data.error === 'You cannot use your own referral code.', 'self referral was not rejected');
   const referredPhone = randomPhone();
   const referredPassword = randomPassword();
-  const referred = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.101.${crypto.randomInt(1, 250)}` }, body: JSON.stringify({ phone: referredPhone, password: referredPassword, referralCode }) });
+  const referred = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.101.${crypto.randomInt(1, 250)}` }, body: JSON.stringify(registrationBody(referredPhone, referredPassword, { referralCode })) });
   assert(referred.response.status === 201, 'referred registration failed');
   secondUserId = referred.data.user.id;
   assert(referred.data.user.referralCode && referred.data.user.referralCode !== referralCode, 'users did not receive distinct referral codes');
@@ -69,11 +70,12 @@ try {
 
   const tasks = await request('/api/tasks', {}, userCookie);
   assert(tasks.data.tasks.length === Number(tasks.data.taskCount) && tasks.data.enabled, 'tasks did not load');
+  const balanceBeforeTask = Number((await pool.query('SELECT balance FROM users WHERE id=$1', [userId])).rows[0].balance);
   const completed = await post('/api/tasks/complete', {}, userCookie);
   assert(completed.response.ok, 'task completion failed');
   const balanceAfterTask = (await pool.query('SELECT balance FROM users WHERE id=$1', [userId])).rows[0].balance;
   const expectedTaskBalance = Number(tasks.data.totalReward);
-  assert(balanceAfterTask === expectedTaskBalance, `task reward was not persisted (${balanceAfterTask} !== ${expectedTaskBalance})`);
+  assert(balanceAfterTask === balanceBeforeTask + expectedTaskBalance, `task reward was not persisted (${balanceAfterTask} !== ${balanceBeforeTask + expectedTaskBalance})`);
 
   const plans = await request('/api/plans', {}, userCookie);
   assert(plans.data.plans.length > 0, 'plans did not load from PostgreSQL');
@@ -98,7 +100,7 @@ try {
   assert(adminSession.response.ok, 'admin session failed');
   const limitUpdate = await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ max_accounts_per_device: 2 }) }, adminCookie);
   assert(limitUpdate.response.ok && Number(limitUpdate.data.settings.max_accounts_per_device) === 2, 'admin device limit update failed');
-  const sameDeviceSecond = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword() }) });
+  const sameDeviceSecond = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify(registrationBody(randomPhone(), randomPassword())) });
   assert(sameDeviceSecond.response.status === 201, 'admin limit of two did not allow the second device account');
   deviceSecondId = sameDeviceSecond.data.user.id;
   const deviceHash = (await pool.query('SELECT device_hash FROM user_devices WHERE user_id = $1 LIMIT 1', [userId])).rows[0].device_hash;
@@ -126,9 +128,18 @@ try {
   assert(['rewarded','credited'].includes(qualifiedReferral.status) && Number(qualifiedReferral.reward_amount) === 80, 'referral was not rewarded after approval');
   const balanceAfterReferralReward = Number((await pool.query('SELECT balance FROM users WHERE id=$1', [userId])).rows[0].balance);
   assert(balanceAfterReferralReward === balanceBeforeReferralReward + 80, 'referral reward amount was not credited exactly once');
+  const referralNotifications = await request('/api/notifications', {}, userCookie);
+  assert(referralNotifications.response.ok, 'user notifications endpoint failed');
+  const referralNotification = referralNotifications.data.notifications.find(item => item.source === 'referral_reward');
+  assert(referralNotification && Number(referralNotification.amount) === 80 && referralNotification.status === 'unread', 'referral earnings notification was not created');
+  await request(`/api/notifications/${referralNotification.id}/read`, { method: 'PATCH' }, userCookie);
+  const updatedReferralNotification = await request('/api/notifications', {}, userCookie);
+  assert(updatedReferralNotification.data.notifications.find(item => item.id === referralNotification.id)?.status === 'read', 'notification read state did not persist');
   await patch(`/api/admin/orders/${qualifiedOrderId}`, { status: 'Approved' }, adminCookie);
   const rewardCount = (await pool.query("SELECT COUNT(*)::int AS count FROM ledger_transactions WHERE source='referral_reward' AND reference=$1", [`referral:${(await pool.query('SELECT id FROM referral_rewards WHERE referred_user_id=$1', [secondUserId])).rows[0].id}`])).rows[0].count;
+  const notificationCount = (await pool.query("SELECT COUNT(*)::int AS count FROM user_notifications WHERE user_id=$1 AND source='referral_reward' AND reference=$2", [userId, `referral:${(await pool.query('SELECT id FROM referral_rewards WHERE referred_user_id=$1', [secondUserId])).rows[0].id}`])).rows[0].count;
   assert(rewardCount === 1, 'referral approval was not idempotent');
+  assert(notificationCount === 1, 'referral notification was duplicated on repeat credit');
   const adminOrders = await request('/api/admin/orders', {}, adminCookie);
   assert(adminOrders.data.orders.some(order => order.id === orderId), 'admin order list failed');
   await patch(`/api/admin/orders/${orderId}`, { status: 'Approved', adminNote: 'Verified in automated test' }, adminCookie);
@@ -152,7 +163,7 @@ try {
   assert([401, 403].includes(normalAdminAttempt.response.status), 'normal user reached admin API');
   const normalDeleteAttempt = await request(`/api/admin/users/${secondUserId}`, { method: 'DELETE' }, referred.cookie);
   assert([401, 403].includes(normalDeleteAttempt.response.status), 'normal user reached admin deletion API');
-  const editedUser = await patch(`/api/admin/users/${secondUserId}`, { name: 'E2E Managed User', email: 'e2e-managed@example.invalid' }, adminCookie);
+  const editedUser = await patch(`/api/admin/users/${secondUserId}`, { name: 'E2E Managed User', email: `e2e-managed-${Date.now()}@example.invalid` }, adminCookie);
   assert(editedUser.response.ok && editedUser.data.user.name === 'E2E Managed User', `admin user edit failed (${editedUser.response.status}): ${editedUser.data.error || 'unexpected response'}`);
 
   const tempPlan = await post('/api/admin/plans', { name: `E2E ${Date.now()}`, investment: 10000, rate: 5, durationDays: 30, description: 'Temporary test plan' }, adminCookie);
@@ -167,11 +178,11 @@ try {
   assert(deletedFirst.response.ok, 'first device user soft deletion failed');
   const historyAfterDelete = Number((await pool.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count);
   assert(historyAfterDelete === 2, 'device registration history was erased by account deletion');
-  const blockedAfterDelete = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword() }) });
+  const blockedAfterDelete = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify(registrationBody(randomPhone(), randomPassword())) });
   assert(blockedAfterDelete.response.status === 409, 'deleted account incorrectly freed its device');
   const exception = await request('/api/admin/device-exceptions', { method: 'POST', body: JSON.stringify({ deviceHash, allowed: true, additionalAccounts: 1, reason: 'E2E approved exception' }) }, adminCookie);
   assert(exception.response.ok, 'admin device exception failed');
-  const sameDeviceThird = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword() }) });
+  const sameDeviceThird = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify(registrationBody(randomPhone(), randomPassword())) });
   assert(sameDeviceThird.response.status === 201, 'authorized device exception did not allow registration');
   deviceThirdId = sameDeviceThird.data.user.id;
   await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ max_accounts_per_device: 1 }) }, adminCookie);

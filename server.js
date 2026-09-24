@@ -12,7 +12,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const { Pool } = pg;
 const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
-const jwtSecret = process.env.JWT_SECRET || 'development-secret-change-me';
+const jwtSecret = String(process.env.JWT_SECRET || '');
+if (jwtSecret.length < 32 || /development|change[-_ ]?me|secret/i.test(jwtSecret)) {
+  throw new Error('JWT_SECRET must be configured with a strong production value of at least 32 characters.');
+}
 const brands = [
   ['Foodpanda', 'Food Delivery'], ['Gul Ahmed', 'Fashion'], ['Naheed', 'Grocery'], ['Nestle', 'Food'],
   ['Bykea', 'Ride Hailing'], ['Coca-Cola', 'Beverages'], ['Zong', 'Telecom'], ['Ufone', 'Telecom'],
@@ -35,7 +38,42 @@ const defaultSettings = {
 
 app.use(express.json({ limit: '6mb' }));
 app.use(cookieParser());
+app.use((req, res, next) => {
+  res.setHeader('Content-Security-Policy', "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; connect-src 'self'; font-src 'self' data: https://fonts.gstatic.com");
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  if (process.env.NODE_ENV === 'production') res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
 app.use(express.static(path.join(__dirname, 'public')));
+
+const allowedOrigins = new Set([process.env.APP_ORIGIN, process.env.VERCEL_URL && `https://${process.env.VERCEL_URL}`].filter(Boolean));
+const originGuard = (req, res, next) => {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  const origin = req.get('origin');
+  if (origin && !allowedOrigins.has(origin) && origin !== `${req.protocol}://${req.get('host')}`) return res.status(403).json({ error: 'Cross-origin request rejected.' });
+  next();
+};
+app.use(originGuard);
+
+const loginAttempts = new Map();
+const loginGuard = (key, res) => {
+  const now = Date.now();
+  const entry = loginAttempts.get(key) || { failures: 0, blockedUntil: 0 };
+  if (entry.blockedUntil > now) {
+    res.status(429).json({ error: 'Too many failed login attempts. Please try again later.' });
+    return false;
+  }
+  return true;
+};
+const recordLoginFailure = key => {
+  const entry = loginAttempts.get(key) || { failures: 0, blockedUntil: 0 };
+  entry.failures += 1;
+  if (entry.failures >= 5) { entry.blockedUntil = Date.now() + 15 * 60 * 1000; entry.failures = 0; }
+  loginAttempts.set(key, entry);
+};
+const clearLoginFailures = key => loginAttempts.delete(key);
 
 const query = async (text, values = []) => {
   if (!pool) throw Object.assign(new Error('DATABASE_URL is not configured'), { status: 503 });
@@ -63,6 +101,12 @@ const writeSetting = async (name, value, actorId = null) => {
     [name, JSON.stringify(value), actorId]
   );
 };
+const insertDefaultSetting = async (name, value) => {
+  await query(
+    'INSERT INTO app_settings(setting_name, setting_value) VALUES($1,$2) ON CONFLICT(setting_name) DO NOTHING',
+    [name, JSON.stringify(value)]
+  );
+};
 
 const readAllSettings = async () => {
   const result = await query('SELECT setting_name, setting_value FROM app_settings ORDER BY setting_name');
@@ -74,7 +118,7 @@ const readAllSettings = async () => {
 };
 
 const normalizeNamePart = value => String(value || '').trim().replace(/\s+/g, ' ');
-const fullNameFor = row => [normalizeNamePart(row.first_name), normalizeNamePart(row.last_name)].filter(Boolean).join(' ') || normalizeNamePart(row.name) || 'VercelPlans member';
+const fullNameFor = row => [normalizeNamePart(row.first_name), normalizeNamePart(row.last_name)].filter(Boolean).join(' ') || normalizeNamePart(row.name) || normalizeNamePart(row.phone) || `User #${row.id}`;
 const initialsFor = row => {
   const first = normalizeNamePart(row.first_name);
   const last = normalizeNamePart(row.last_name);
@@ -118,18 +162,20 @@ const buildUserPlanSummary = async (userId, now = new Date()) => {
     const durationDays = Number(order.duration_days || 0);
     const totalDurationMs = durationDays * 24 * 60 * 60 * 1000;
     const elapsedDays = Math.max(0, Math.min(durationDays, Math.floor((now.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000))));
-    const remainingDays = Math.max(0, durationDays - elapsedDays);
-    const isStillActive = remainingDays > 0 && durationDays > 0;
+    const isStillActive = elapsedDays < durationDays && durationDays > 0;
 
     if (!isStillActive) continue;
 
     const earnedResult = await query(
-      'SELECT COALESCE(SUM(profit_amount), 0) AS earned_amount FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2',
+      'SELECT COALESCE(SUM(profit_amount), 0) AS earned_amount, COUNT(*)::int AS credited_days FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND status = \'posted\'',
       [userId, order.id]
     );
 
     const totalEarned = Number(earnedResult.rows[0]?.earned_amount || 0);
-    const progressPercent = durationDays > 0 ? Math.min(100, Math.round((elapsedDays / durationDays) * 100)) : 0;
+    const creditedDays = Number(earnedResult.rows[0]?.credited_days || 0);
+    const completedDays = Math.min(durationDays, creditedDays);
+    const remainingDays = Math.max(0, durationDays - completedDays);
+    const progressPercent = durationDays > 0 ? Math.min(100, Math.round((completedDays / durationDays) * 100)) : 0;
 
     results.push({
       order_id: order.id,
@@ -140,7 +186,7 @@ const buildUserPlanSummary = async (userId, now = new Date()) => {
       total_return: Number(order.total_return || 0),
       total_earned: totalEarned,
       duration_days: durationDays,
-      days_completed: elapsedDays,
+      days_completed: completedDays,
       days_remaining: remainingDays,
       progress_percent: progressPercent,
       start_date: startDate.toISOString(),
@@ -200,7 +246,7 @@ const adminAuth = async (req, res, next) => {
   try {
     const payload = jwt.verify(req.cookies.vp_admin_token || '', jwtSecret);
     if (!payload.admin) throw new Error('Invalid admin session');
-    const result = await query('SELECT * FROM users WHERE role = \'admin\' AND ($1::integer IS NULL OR id=$1) ORDER BY id LIMIT 1', [payload.userId || null]);
+    const result = await query('SELECT * FROM users WHERE role = \'admin\' AND status = \'active\' AND ($1::integer IS NULL OR id=$1) ORDER BY id LIMIT 1', [payload.userId || null]);
     if (!result.rows[0]) throw new Error('Admin account not found');
     req.admin = result.rows[0];
     next();
@@ -214,6 +260,32 @@ const createLedgerEntry = async (client, userId, amount, type, source, reference
     'INSERT INTO ledger_transactions(user_id, amount, type, status, reference, source, metadata) VALUES($1,$2,$3,\'posted\',$4,$5,$6::jsonb)',
     [userId, amount, type, reference, source, JSON.stringify(metadata || {})]
   );
+};
+
+const makeNotificationPayload = row => ({
+  id: row.id,
+  userId: row.user_id,
+  title: row.title,
+  message: row.message,
+  amount: Number(row.amount || 0),
+  reason: row.reason,
+  source: row.source,
+  reference: row.reference,
+  status: row.status,
+  createdAt: row.created_at,
+  metadata: row.metadata || {},
+});
+
+const createUserNotification = async (client, userId, { title, message, amount = 0, reason = '', source = '', reference = '', metadata = {} } = {}) => {
+  if (!userId || !source || !reference) return null;
+  const result = await client.query(
+    `INSERT INTO user_notifications(user_id, title, message, amount, reason, source, reference, metadata, status)
+     VALUES($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'unread')
+     ON CONFLICT(user_id, source, reference) DO NOTHING
+     RETURNING *`,
+    [userId, title || 'Congratulations!', message || 'Your balance has been updated.', Number(amount || 0), String(reason || ''), String(source), String(reference), JSON.stringify(metadata || {})]
+  );
+  return result.rowCount ? result.rows[0] : null;
 };
 
 const rewardReferralForApprovedOrder = async (client, orderId, referredUserId) => {
@@ -231,6 +303,15 @@ const rewardReferralForApprovedOrder = async (client, orderId, referredUserId) =
 
   await client.query('UPDATE users SET referral_earnings = referral_earnings + $1, balance = balance + $1, updated_at = NOW() WHERE id = $2', [reward.reward_amount, reward.referrer_user_id]);
   await createLedgerEntry(client, reward.referrer_user_id, reward.reward_amount, 'credit', 'referral_reward', `referral:${reward.id}`, { referred_user_id: referredUserId, qualified_order_id: orderId, reward_amount: reward.reward_amount });
+  await createUserNotification(client, reward.referrer_user_id, {
+    title: 'Congratulations!',
+    message: 'Referral reward credited successfully.',
+    amount: reward.reward_amount,
+    reason: 'Referral reward',
+    source: 'referral_reward',
+    reference: `referral:${reward.id}`,
+    metadata: { referred_user_id: referredUserId, qualified_order_id: orderId, reward_amount: reward.reward_amount },
+  });
   return true;
 };
 
@@ -298,17 +379,22 @@ const ensureDatabaseSchema = async () => {
     `ALTER TABLE device_exceptions ADD COLUMN IF NOT EXISTS additional_accounts INTEGER NOT NULL DEFAULT 1;`,
     `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'device_exceptions_additional_accounts_check') THEN ALTER TABLE device_exceptions ADD CONSTRAINT device_exceptions_additional_accounts_check CHECK (additional_accounts >= 0); END IF; END $$;`,
     `CREATE TABLE IF NOT EXISTS referral_rewards (id SERIAL PRIMARY KEY, referrer_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, referred_user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, reward_amount INTEGER NOT NULL DEFAULT 0, status VARCHAR(20) NOT NULL DEFAULT 'credited', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_rewards_referred_user ON referral_rewards(referred_user_id);`,
     `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS qualified_order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL;`,
     `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS qualified_at TIMESTAMPTZ;`,
     `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS rewarded_at TIMESTAMPTZ;`,
     `CREATE TABLE IF NOT EXISTS ledger_transactions (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, amount INTEGER NOT NULL, type VARCHAR(20) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'posted', reference VARCHAR(200) NOT NULL DEFAULT '', source VARCHAR(120) NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
+    `CREATE TABLE IF NOT EXISTS user_notifications (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(200) NOT NULL DEFAULT 'Congratulations!', message TEXT NOT NULL DEFAULT '', amount INTEGER NOT NULL DEFAULT 0, reason VARCHAR(180) NOT NULL DEFAULT '', source VARCHAR(120) NOT NULL DEFAULT '', reference VARCHAR(200) NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}', status VARCHAR(20) NOT NULL DEFAULT 'unread', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), read_at TIMESTAMPTZ, UNIQUE(user_id, source, reference));`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_user_notifications_unique ON user_notifications(user_id, source, reference);`,
     `CREATE TABLE IF NOT EXISTS plan_daily_profits (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, profit_date DATE NOT NULL, profit_amount INTEGER NOT NULL DEFAULT 0, status VARCHAR(20) NOT NULL DEFAULT 'posted', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, order_id, profit_date));`,
     `CREATE TABLE IF NOT EXISTS daily_task_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_date DATE NOT NULL, task_key VARCHAR(120) NOT NULL, task_name VARCHAR(120) NOT NULL, category VARCHAR(80) NOT NULL DEFAULT '', reward_amount INTEGER NOT NULL DEFAULT 0, completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, task_date, task_key));`,
     `CREATE TABLE IF NOT EXISTS admin_audit_log (id SERIAL PRIMARY KEY, actor_user_id INTEGER REFERENCES users(id), target_user_id INTEGER REFERENCES users(id), action VARCHAR(120) NOT NULL, metadata JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
     `CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by);`,
     `CREATE INDEX IF NOT EXISTS idx_orders_user_status_active ON orders(user_id, status, active);`,
     `CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status ON withdrawals(user_id, status);`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_withdrawals_user_pending_unique ON withdrawals(user_id) WHERE status IN ('pending', 'Processing');`,
     `CREATE INDEX IF NOT EXISTS idx_ledger_user_created ON ledger_transactions(user_id, created_at DESC);`,
+    `CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON user_notifications(user_id, created_at DESC);`,
     `CREATE INDEX IF NOT EXISTS idx_daily_tasks_user_date ON daily_task_assignments(user_id, task_date, completed_at);`,
   ];
 
@@ -345,9 +431,8 @@ const ensureDatabaseSchema = async () => {
   await query('ALTER TABLE users ALTER COLUMN referral_code SET NOT NULL');
   await query('ALTER TABLE referral_rewards ALTER COLUMN status SET DEFAULT \'registered\'');
 
-  for (const [name, value] of Object.entries(defaultSettings)) {
-    await writeSetting(name, value);
-  }
+  for (const [name, value] of Object.entries(defaultSettings)) await insertDefaultSetting(name, value);
+  await query("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_active_unique ON users (lower(trim(email))) WHERE status != 'deleted' AND NULLIF(trim(email), '') IS NOT NULL");
 };
 
 const generateReferralCode = () => crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -362,6 +447,22 @@ const calculatePlanValues = ({ investment, rate, durationDays }) => {
   const dailyReturn = Math.round(normalizedInvestment * (normalizedRate / 100));
   const totalReturn = dailyReturn * normalizedDuration;
   return { investment: Math.round(normalizedInvestment), rate: Number(normalizedRate.toFixed(4)), durationDays: normalizedDuration, dailyReturn, totalReturn };
+};
+
+const validatePaymentProof = value => {
+  const proof = String(value || '');
+  const match = proof.match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) throw Object.assign(new Error('Payment proof must be a PNG, JPEG, or WEBP image.'), { status: 400 });
+  let bytes;
+  try { bytes = Buffer.from(match[2], 'base64'); } catch { throw Object.assign(new Error('Payment proof is not valid base64.'), { status: 400 }); }
+  if (!bytes.length || bytes.length > 5 * 1024 * 1024) throw Object.assign(new Error('Payment proof must be between 1 byte and 5 MB.'), { status: 400 });
+  const signatures = {
+    'image/png': bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])),
+    'image/jpeg': bytes.subarray(0, 3).equals(Buffer.from([255, 216, 255])),
+    'image/webp': bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP',
+  };
+  if (!signatures[match[1].toLowerCase()]) throw Object.assign(new Error('Payment proof image signature is invalid.'), { status: 400 });
+  return proof;
 };
 
 const ensureUserDailyTasks = async userId => {
@@ -421,8 +522,18 @@ const processDailyPlanProfits = async (targetDate = new Date()) => {
         [order.user_id, order.id, order.plan_id, dateString, profitAmount]
       );
       if (inserted.rowCount) {
+        const profitReference = `plan_profit:${order.id}:${dateString}`;
         await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [profitAmount, order.user_id]);
-        await createLedgerEntry(client, order.user_id, profitAmount, 'credit', 'daily_plan_profit', `plan_profit:${order.id}:${dateString}`, { order_id: order.id, plan_id: order.plan_id, profit_date: dateString, amount: profitAmount });
+        await createLedgerEntry(client, order.user_id, profitAmount, 'credit', 'daily_plan_profit', profitReference, { order_id: order.id, plan_id: order.plan_id, profit_date: dateString, amount: profitAmount });
+        await createUserNotification(client, order.user_id, {
+          title: 'Congratulations!',
+          message: 'Plan earning credited successfully.',
+          amount: profitAmount,
+          reason: 'Plan earning',
+          source: 'daily_plan_profit',
+          reference: profitReference,
+          metadata: { order_id: order.id, plan_id: order.plan_id, profit_date: dateString, amount: profitAmount },
+        });
         processed += 1;
         total += profitAmount;
       }
@@ -438,7 +549,10 @@ const processDailyPlanProfits = async (targetDate = new Date()) => {
   return { processed, total };
 };
 
-app.get('/api/session', auth, (req, res) => res.json({ user: safeUser(req.user) }));
+app.get('/api/session', auth, async (req, res) => {
+  const settings = await readAllSettings();
+  res.json({ user: { ...safeUser(req.user), minimumWithdrawalAmount: Number(settings.minimum_withdrawal_amount || 0) } });
+});
 
 app.get('/api/dashboard', auth, async (req, res) => {
   const dashboard = await buildUserDashboardData(req.user.id);
@@ -468,7 +582,7 @@ app.post('/api/register', async (req, res) => {
     if (client) await client.query('BEGIN');
     if (settings.device_restriction_enabled) {
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [deviceHash]);
-      const accountCount = Number((await db.query("SELECT COUNT(*)::int AS count FROM user_devices ud JOIN users u ON u.id = ud.user_id WHERE ud.device_hash = $1 AND u.status <> 'deleted'", [deviceHash])).rows[0].count || 0);
+      const accountCount = Number((await db.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count || 0);
       const exception = (await db.query('SELECT allowed, additional_accounts FROM device_exceptions WHERE device_hash = $1', [deviceHash])).rows[0];
       const configuredLimit = Math.max(1, Number(settings.max_accounts_per_device || (settings.allow_multiple_accounts_per_device ? 2 : 1)));
       const allowedLimit = configuredLimit + (exception?.allowed ? Math.max(0, Number(exception.additional_accounts || 0)) : 0);
@@ -521,16 +635,27 @@ app.post('/api/register', async (req, res) => {
         [referrer.id, created.rows[0].id, rewardAmount]
       );
       await db.query('UPDATE users SET total_referrals = total_referrals + 1, updated_at = NOW() WHERE id = $1', [referrer.id]);
-      const accountCreationReward = Number(settings.account_creation_reward_amount || 0);
-      if (accountCreationReward > 0) {
-        await db.query('UPDATE users SET balance = balance + $1, referral_earnings = referral_earnings + $1, updated_at = NOW() WHERE id = $2', [accountCreationReward, referrer.id]);
-        await createLedgerEntry(db, referrer.id, accountCreationReward, 'credit', 'account_creation_reward', `account_creation:${created.rows[0].id}`, { referred_user_id: created.rows[0].id, amount: accountCreationReward });
-      }
+    }
+
+    const accountCreationReward = Number(settings.account_creation_reward_amount || 0);
+    if (accountCreationReward > 0) {
+      await db.query('UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE id = $2', [accountCreationReward, created.rows[0].id]);
+      await createLedgerEntry(db, created.rows[0].id, accountCreationReward, 'credit', 'account_creation_reward', `account_creation:${created.rows[0].id}`, { amount: accountCreationReward });
+      const notification = await createUserNotification(db, created.rows[0].id, {
+        title: 'Congratulations!',
+        message: 'Your account creation bonus was credited successfully.',
+        amount: accountCreationReward,
+        reason: 'Account creation reward credited',
+        source: 'account_creation_reward',
+        reference: `account_creation:${created.rows[0].id}`,
+        metadata: { amount: accountCreationReward },
+      });
+      if (notification) created.rows[0].notification = makeNotificationPayload(notification);
     }
 
     if (client) await client.query('COMMIT');
     issueAuth(res, created.rows[0].id);
-    res.status(201).json({ user: safeUser(created.rows[0]) });
+    res.status(201).json({ user: safeUser(created.rows[0]), notification: created.rows[0].notification || null });
   } catch (error) {
     if (client) await client.query('ROLLBACK');
     res.status(error.status || 500).json({ error: error.message });
@@ -542,10 +667,14 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
   try {
     const phone = String(req.body.phone || '').trim();
+    const attemptKey = `user:${req.ip}:${phone}`;
+    if (!loginGuard(attemptKey, res)) return;
     const result = await query('SELECT * FROM users WHERE phone = $1 AND status = \'active\'', [phone]);
     if (!result.rows[0] || !(await bcrypt.compare(req.body.password || '', result.rows[0].password_hash))) {
+      recordLoginFailure(attemptKey);
       return res.status(401).json({ error: 'The mobile number or password is incorrect.' });
     }
+    clearLoginFailures(attemptKey);
     await query('UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1', [result.rows[0].id]);
     issueAuth(res, result.rows[0].id);
     res.json({ user: safeUser(result.rows[0]) });
@@ -561,8 +690,11 @@ app.post('/api/admin/login', async (req, res) => {
     const identifier = String(req.body.email || '').trim().toLowerCase();
     const configuredEmail = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
     const configuredPhone = String(process.env.ADMIN_PHONE || '').trim();
-    const result = await query('SELECT * FROM users WHERE role = \'admin\' ORDER BY id');
+    const attemptKey = `admin:${req.ip}:${identifier}`;
+    if (!loginGuard(attemptKey, res)) return;
+    const result = await query('SELECT * FROM users WHERE role = \'admin\' AND status = \'active\' ORDER BY id');
     if (!identifier || (identifier !== configuredEmail && identifier !== configuredPhone)) {
+      recordLoginFailure(attemptKey);
       return res.status(401).json({ error: 'Invalid admin credentials.' });
     }
     let admin = null;
@@ -572,7 +704,8 @@ app.post('/api/admin/login', async (req, res) => {
         break;
       }
     }
-    if (!admin) return res.status(401).json({ error: 'Invalid admin credentials.' });
+    if (!admin) { recordLoginFailure(attemptKey); return res.status(401).json({ error: 'Invalid admin credentials.' }); }
+    clearLoginFailures(attemptKey);
     issueAdminAuth(res, admin.id);
     res.json({ ok: true });
   } catch (error) {
@@ -665,11 +798,21 @@ app.post('/api/tasks/:id/complete', auth, async (req, res) => {
         reward = Number(settings.daily_task_reward_amount || 0) * taskCount;
         await client.query('UPDATE users SET balance = balance + $1, total_reviews = total_reviews + $2, updated_at = NOW() WHERE id = $3', [reward, taskCount, req.user.id]);
         await createLedgerEntry(client, req.user.id, reward, 'credit', 'daily_task_reward', rewardReference, { task_count: taskCount, reward_per_task: Number(settings.daily_task_reward_amount || 0) });
+        const notification = await createUserNotification(client, req.user.id, {
+          title: 'Congratulations!',
+          message: 'Daily task reward credited successfully.',
+          amount: reward,
+          reason: 'Daily task reward',
+          source: 'daily_task_reward',
+          reference: rewardReference,
+          metadata: { task_count: taskCount, reward_per_task: Number(settings.daily_task_reward_amount || 0) },
+        });
+        if (notification) { res.locals.notification = makeNotificationPayload(notification); }
       }
     }
 
     await client.query('COMMIT');
-    res.json({ ok: true, alreadyCompleted: false, reward, completed: completedCount >= taskCount, progress: completedCount });
+    res.json({ ok: true, alreadyCompleted: false, reward, completed: completedCount >= taskCount, progress: completedCount, notification: res.locals.notification || null });
   } catch (error) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
@@ -683,7 +826,7 @@ app.post('/api/tasks/complete', auth, async (req, res) => {
   try {
     await client.query('BEGIN');
     const rewardPerTask = Number(await readSetting('daily_task_reward_amount', 20));
-    const rows = await client.query('SELECT * FROM daily_task_assignments WHERE user_id = $1 AND task_date = CURRENT_DATE AND completed_at IS NULL ORDER BY id', [req.user.id]);
+    const rows = await client.query('SELECT * FROM daily_task_assignments WHERE user_id = $1 AND task_date = CURRENT_DATE AND completed_at IS NULL ORDER BY id FOR UPDATE', [req.user.id]);
     if (!rows.rowCount) {
       await client.query('COMMIT');
       return res.json({ ok: true, reward: 0, completed: true });
@@ -692,9 +835,24 @@ app.post('/api/tasks/complete', auth, async (req, res) => {
     await client.query('UPDATE daily_task_assignments SET completed_at = NOW() WHERE id = ANY($1)', [ids]);
     const totalReward = rows.rowCount * rewardPerTask;
     await client.query('UPDATE users SET balance = balance + $1, total_reviews = total_reviews + $2 WHERE id = $3', [totalReward, rows.rowCount, req.user.id]);
-    await createLedgerEntry(client, req.user.id, totalReward, 'credit', 'daily_task_reward', `daily_task:${req.user.id}:${new Date().toISOString().slice(0, 10)}`, { task_count: rows.rowCount, reward_per_task: rewardPerTask });
+    const creditReference = `daily_task_reward:${req.user.id}:${new Date().toISOString().slice(0, 10)}`;
+    const existingReward = await client.query('SELECT 1 FROM ledger_transactions WHERE user_id = $1 AND source = \'daily_task_reward\' AND reference = $2 LIMIT 1', [req.user.id, creditReference]);
+    if (existingReward.rowCount) {
+      await client.query('COMMIT');
+      return res.json({ ok: true, reward: 0, completed: true, alreadyCompleted: true });
+    }
+    await createLedgerEntry(client, req.user.id, totalReward, 'credit', 'daily_task_reward', creditReference, { task_count: rows.rowCount, reward_per_task: rewardPerTask });
+    const notification = await createUserNotification(client, req.user.id, {
+      title: 'Congratulations!',
+      message: 'Daily task reward credited successfully.',
+      amount: totalReward,
+      reason: 'Daily task reward',
+      source: 'daily_task_reward',
+      reference: creditReference,
+      metadata: { task_count: rows.rowCount, reward_per_task: rewardPerTask },
+    });
     await client.query('COMMIT');
-    res.json({ ok: true, reward: totalReward, completed: true });
+    res.json({ ok: true, reward: totalReward, completed: true, notification: notification ? makeNotificationPayload(notification) : null });
   } catch (error) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: error.message });
@@ -703,9 +861,25 @@ app.post('/api/tasks/complete', auth, async (req, res) => {
   }
 });
 
+app.get('/api/notifications', auth, async (req, res) => {
+  const rows = await query('SELECT * FROM user_notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [req.user.id]);
+  res.json({ notifications: rows.rows.map(makeNotificationPayload) });
+});
+
+app.patch('/api/notifications/:id/read', auth, async (req, res) => {
+  const result = await query('UPDATE user_notifications SET status = \'read\', read_at = NOW() WHERE id = $1 AND user_id = $2 RETURNING *', [req.params.id, req.user.id]);
+  if (!result.rowCount) return res.status(404).json({ error: 'Notification not found.' });
+  res.json({ notification: makeNotificationPayload(result.rows[0]) });
+});
+
 app.get('/api/withdrawals', auth, async (req, res) => {
   const withdrawals = await query('SELECT id, wallet, account_number, account_holder, amount, status, created_at FROM withdrawals WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
   res.json({ withdrawals: withdrawals.rows });
+});
+
+app.get('/api/account-config', auth, async (req, res) => {
+  const settings = await readAllSettings();
+  res.json({ minimumWithdrawalAmount: Number(settings.minimum_withdrawal_amount || 0) });
 });
 
 app.post('/api/withdrawals', auth, async (req, res) => {
@@ -720,9 +894,6 @@ app.post('/api/withdrawals', auth, async (req, res) => {
   if (!Number.isFinite(withdrawalAmount) || withdrawalAmount < minimum) {
     return res.status(400).json({ error: `Minimum withdrawal amount is PKR ${minimum}.` });
   }
-  if (withdrawalAmount > Number(req.user.balance || 0)) {
-    return res.status(400).json({ error: 'Your withdrawal amount exceeds your available balance.' });
-  }
   if (!wallet || !accountNumber || !accountHolder) {
     return res.status(400).json({ error: 'Please provide wallet, account number and account holder name.' });
   }
@@ -730,15 +901,21 @@ app.post('/api/withdrawals', auth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const pendingExists = await client.query('SELECT 1 FROM withdrawals WHERE user_id = $1 AND status IN (\'pending\',\'Processing\') LIMIT 1', [req.user.id]);
+    const user = await client.query('SELECT id, balance FROM users WHERE id = $1 FOR UPDATE', [req.user.id]);
+    const pendingExists = await client.query('SELECT 1 FROM withdrawals WHERE user_id = $1 AND status IN (\'pending\',\'Processing\') FOR UPDATE', [req.user.id]);
     if (pendingExists.rowCount) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'You already have a pending withdrawal request.' });
+    }
+    if (withdrawalAmount > Number(user.rows[0]?.balance || 0)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Your withdrawal amount exceeds your available balance.' });
     }
     const result = await client.query(
       'INSERT INTO withdrawals(user_id,wallet,account_number,account_holder,amount,status) VALUES($1,$2,$3,$4,$5,\'pending\') RETURNING *',
       [req.user.id, wallet, accountNumber, accountHolder, withdrawalAmount]
     );
+    await client.query('UPDATE users SET balance = balance - $1, updated_at = NOW() WHERE id = $2', [withdrawalAmount, req.user.id]);
     await client.query('INSERT INTO ledger_transactions(user_id, amount, type, status, reference, source, metadata) VALUES($1,$2,\'debit\',\'pending\',$3,$4,$5::jsonb)',
       [req.user.id, withdrawalAmount, `withdrawal:${result.rows[0].id}`, 'withdrawal_request', JSON.stringify({ withdrawal_id: result.rows[0].id, amount: withdrawalAmount })]);
     await client.query('COMMIT');
@@ -776,9 +953,10 @@ app.post('/api/orders', auth, async (req, res) => {
   const plan = (await query('SELECT * FROM plans WHERE id = $1 AND active = true', [planId])).rows[0];
   const method = (await query('SELECT * FROM payment_methods WHERE id = $1 AND enabled = true', [paymentMethodId])).rows[0];
   if (!plan || !method) return res.status(400).json({ error: 'Choose an active plan and payment method.' });
+  const validatedProof = validatePaymentProof(paymentProof);
   const result = await query(
     'INSERT INTO orders(user_id, plan_id, payment_method_id, investment, payment_reference, payment_details, payment_proof, status) VALUES($1,$2,$3,$4,$5,$6,$7,\'Pending\') RETURNING id',
-    [req.user.id, plan.id, method.id, plan.investment, paymentReference, paymentDetails, paymentProof]
+    [req.user.id, plan.id, method.id, plan.investment, paymentReference, paymentDetails, validatedProof]
   );
   res.status(201).json({ orderId: result.rows[0].id });
 });
@@ -823,8 +1001,13 @@ app.patch('/api/admin/plans/:id', adminAuth, async (req, res) => {
 });
 
 app.delete('/api/admin/plans/:id', adminAuth, async (req, res) => {
+  const referenced = await query('SELECT 1 FROM orders WHERE plan_id = $1 LIMIT 1', [req.params.id]);
+  if (referenced.rowCount) {
+    await query('UPDATE plans SET active = false WHERE id = $1', [req.params.id]);
+    return res.json({ ok: true, archived: true });
+  }
   await query('DELETE FROM plans WHERE id = $1', [req.params.id]);
-  res.json({ ok: true });
+  res.json({ ok: true, archived: false });
 });
 
 app.get('/api/admin/orders', adminAuth, async (req, res) => {
@@ -840,19 +1023,24 @@ app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
     const currentOrder = await client.query('SELECT * FROM orders WHERE id = $1 FOR UPDATE', [req.params.id]);
     if (!currentOrder.rowCount) return res.status(404).json({ error: 'Order not found.' });
     const nextStatus = status || currentOrder.rows[0].status;
+    const transitions = { Pending: ['Approved', 'Rejected'], Processing: ['Approved', 'Rejected'] };
+    if (nextStatus !== currentOrder.rows[0].status && !transitions[currentOrder.rows[0].status]?.includes(nextStatus)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `Invalid order transition: ${currentOrder.rows[0].status} to ${nextStatus}.` });
+    }
     const activeFlag = nextStatus === 'Approved';
     const updated = await client.query(
       'UPDATE orders SET status = $1, admin_note = COALESCE($2, admin_note), active = $3, activated_at = CASE WHEN $3 THEN COALESCE(activated_at, NOW()) ELSE activated_at END, updated_at = NOW() WHERE id = $4 RETURNING *',
       [nextStatus, adminNote, activeFlag, req.params.id]
     );
-    if (nextStatus === 'Approved' && !currentOrder.rows[0].active) {
+    if (nextStatus === 'Approved' && currentOrder.rows[0].status !== 'Approved') {
       await client.query('UPDATE orders SET active = true, activated_at = COALESCE(activated_at, NOW()) WHERE id = $1', [req.params.id]);
     }
     if (nextStatus !== 'Approved' && currentOrder.rows[0].active) {
       await client.query('UPDATE orders SET active = false WHERE id = $1', [req.params.id]);
     }
     if (nextStatus === 'Approved') await rewardReferralForApprovedOrder(client, req.params.id, currentOrder.rows[0].user_id);
-    if (nextStatus === 'Approved' && !currentOrder.rows[0].active && await readSetting('daily_profit_enabled', true)) {
+    if (nextStatus === 'Approved' && currentOrder.rows[0].status !== 'Approved' && await readSetting('daily_profit_enabled', true)) {
       const plan = await client.query('SELECT daily_return FROM plans WHERE id = $1', [currentOrder.rows[0].plan_id]);
       const profitDate = new Date().toISOString().slice(0, 10);
       const firstDayProfit = await client.query(
@@ -890,14 +1078,20 @@ app.patch('/api/admin/withdrawals/:id', adminAuth, async (req, res) => {
     if (!currentWithdrawal.rowCount) return res.status(404).json({ error: 'Withdrawal request not found.' });
     const withdrawal = currentWithdrawal.rows[0];
     const nextStatus = status || withdrawal.status;
+    const transitions = { pending: ['Processing', 'Approved', 'Rejected'], Processing: ['Approved', 'Rejected'] };
+    if (nextStatus !== withdrawal.status && !transitions[withdrawal.status]?.includes(nextStatus)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `Invalid withdrawal transition: ${withdrawal.status} to ${nextStatus}.` });
+    }
     if (nextStatus === 'Approved' && withdrawal.status !== 'Approved') {
-      const user = await client.query('SELECT * FROM users WHERE id = $1 FOR UPDATE', [withdrawal.user_id]);
-      if (withdrawal.amount > Number(user.rows[0].balance || 0)) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'User does not have enough available balance to approve this withdrawal.' });
+      await client.query('UPDATE ledger_transactions SET status = \'posted\', metadata = metadata || $2::jsonb WHERE user_id = $1 AND reference = $3', [withdrawal.user_id, JSON.stringify({ status: 'Approved' }), `withdrawal:${withdrawal.id}`]);
+    }
+    if (nextStatus === 'Rejected' && withdrawal.status !== 'Rejected') {
+      const refunded = await client.query('UPDATE withdrawals SET rejection_reason = COALESCE($1, rejection_reason) WHERE id = $2 AND status IN (\'pending\', \'Processing\') RETURNING id', [rejectionReason || withdrawal.rejection_reason, withdrawal.id]);
+      if (refunded.rowCount) {
+        await client.query('UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE id = $2', [withdrawal.amount, withdrawal.user_id]);
+        await createLedgerEntry(client, withdrawal.user_id, withdrawal.amount, 'credit', 'withdrawal_refund', `withdrawal:${withdrawal.id}:refund`, { withdrawal_id: withdrawal.id, amount: withdrawal.amount, status: 'Rejected' });
       }
-      await client.query('UPDATE users SET balance = balance - $1 WHERE id = $2', [withdrawal.amount, withdrawal.user_id]);
-      await createLedgerEntry(client, withdrawal.user_id, withdrawal.amount, 'debit', 'withdrawal', `withdrawal:${withdrawal.id}`, { withdrawal_id: withdrawal.id, amount: withdrawal.amount, status: 'posted' });
     }
     const updated = await client.query(
       'UPDATE withdrawals SET status = $1::varchar, approved_by = COALESCE($2, approved_by), approved_at = CASE WHEN $1::varchar = \'Approved\' THEN NOW() ELSE approved_at END, rejection_reason = COALESCE($3, rejection_reason) WHERE id = $4 RETURNING *',
@@ -1003,7 +1197,8 @@ app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
 
   const [orders, withdrawals, tasks, referrals, referredBy, ledger, devices, audit] = await Promise.all([
     query(`SELECT o.*, p.name AS plan_name, p.return_rate, p.daily_return, p.duration_days, p.total_return,
-      pm.name AS payment_method, COALESCE((SELECT SUM(profit_amount) FROM plan_daily_profits pp WHERE pp.order_id = o.id AND pp.status = 'posted'), 0)::int AS total_earned
+      pm.name AS payment_method, COALESCE((SELECT SUM(profit_amount) FROM plan_daily_profits pp WHERE pp.order_id = o.id AND pp.status = 'posted'), 0)::int AS total_earned,
+      COALESCE((SELECT COUNT(*) FROM plan_daily_profits pp WHERE pp.order_id = o.id AND pp.status = 'posted'), 0)::int AS credited_days
       FROM orders o JOIN plans p ON p.id = o.plan_id LEFT JOIN payment_methods pm ON pm.id = o.payment_method_id
       WHERE o.user_id = $1 ORDER BY o.created_at DESC`, [userId]),
     query('SELECT * FROM withdrawals WHERE user_id = $1 ORDER BY created_at DESC', [userId]),
@@ -1023,7 +1218,7 @@ app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
     const start = order.activated_at || order.created_at;
     const duration = Number(order.duration_days || 0);
     const startTime = new Date(start).getTime();
-    const completed = order.status === 'Approved' && order.active ? Math.max(0, Math.min(duration, Math.floor((now - startTime) / 86400000))) : 0;
+    const completed = order.status === 'Approved' && order.active ? Math.max(0, Math.min(duration, Number(order.credited_days || 0))) : 0;
     const remaining = order.status === 'Approved' && order.active ? Math.max(0, duration - completed) : 0;
     const expired = order.status === 'Approved' && order.active && remaining === 0 && duration > 0;
     return { ...order, rate: Number(order.return_rate || 0), daily_profit: Number(order.daily_return || 0), total_earned: Number(order.total_earned || 0), days_completed: completed, days_remaining: remaining, start_date: start, end_date: new Date(startTime + duration * 86400000).toISOString(), display_status: expired ? 'Expired' : order.status === 'Approved' && order.active ? 'Active' : order.status };
@@ -1099,8 +1294,21 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
         await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Balance adjustment cannot make the balance negative.' });
       }
+      const adjustmentReference = `admin_adjustment:${req.params.id}:${Date.now()}`;
       await client.query('UPDATE users SET balance = $1, updated_at = NOW() WHERE id = $2', [nextBalance, req.params.id]);
-      await createLedgerEntry(client, req.params.id, salaryAdjusted, salaryAdjusted > 0 ? 'credit' : 'debit', 'admin_adjustment', `admin_adjustment:${req.params.id}:${Date.now()}`, { previous_balance: previousBalance, new_balance: nextBalance, note: body.balanceReason || 'Admin balance adjustment', admin_id: req.admin.id });
+      await createLedgerEntry(client, req.params.id, salaryAdjusted, salaryAdjusted > 0 ? 'credit' : 'debit', 'admin_adjustment', adjustmentReference, { previous_balance: previousBalance, new_balance: nextBalance, note: body.balanceReason || 'Admin balance adjustment', admin_id: req.admin.id });
+      if (salaryAdjusted > 0) {
+        const notification = await createUserNotification(client, req.params.id, {
+          title: 'Congratulations!',
+          message: (body.balanceReason || 'Admin-approved balance credit') + ' credited successfully.',
+          amount: salaryAdjusted,
+          reason: body.balanceReason || 'Admin-approved balance credit',
+          source: 'admin_adjustment',
+          reference: adjustmentReference,
+          metadata: { previous_balance: previousBalance, new_balance: nextBalance, note: body.balanceReason || 'Admin balance adjustment', admin_id: req.admin.id },
+        });
+        if (notification) { res.locals.notification = makeNotificationPayload(notification); }
+      }
       await insertAuditLogWithClient(client, req.admin.id, req.params.id, 'balance_adjustment', { amount: salaryAdjusted, previous_balance: previousBalance, new_balance: nextBalance, reason: body.balanceReason || '' });
     }
     if (body.name !== undefined || body.firstName !== undefined || body.lastName !== undefined || body.email !== undefined || body.phone !== undefined || body.status !== undefined) {
@@ -1134,7 +1342,7 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
     }
     const refreshed = await client.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
     await client.query('COMMIT');
-    res.json({ user: safeUser(refreshed.rows[0]) });
+    res.json({ user: safeUser(refreshed.rows[0]), notification: res.locals.notification || null });
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {
@@ -1217,8 +1425,10 @@ app.post('/api/admin/device-exceptions', adminAuth, async (req, res) => {
 });
 
 app.post('/api/cron/daily-profit', async (req, res) => {
-  const secret = req.headers['x-vercel-cron-secret'] || req.body?.secret;
-  if (process.env.VERCEL_CRON_SECRET && secret && secret !== process.env.VERCEL_CRON_SECRET) {
+  const configuredSecret = String(process.env.VERCEL_CRON_SECRET || '');
+  const secret = String(req.headers['x-vercel-cron-secret'] || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '');
+  const secretMatches = secret.length === configuredSecret.length && crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(configuredSecret));
+  if (!configuredSecret || !secret || !secretMatches) {
     return res.status(401).json({ error: 'Invalid cron secret.' });
   }
   const result = await processDailyPlanProfits(new Date());
