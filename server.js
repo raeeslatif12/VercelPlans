@@ -29,6 +29,7 @@ const query = async (text, values = []) => {
 };
 const safeUser = row => ({ id: row.id, phone: row.phone, role: row.role || 'user', referralCode: row.referral_code, balance: row.balance, totalReviews: row.total_reviews, totalReferrals: row.total_referrals, referralEarnings: row.referral_earnings });
 const issueAuth = (res, userId) => res.cookie('vp_token', jwt.sign({ userId }, jwtSecret, { expiresIn: '7d' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 604800000 });
+const issueAdminAuth = res => res.cookie('vp_admin_token', jwt.sign({ admin: true }, jwtSecret, { expiresIn: '8h' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 28800000 });
 const auth = async (req, res, next) => {
   try {
     const token = req.cookies.vp_token;
@@ -40,21 +41,40 @@ const auth = async (req, res, next) => {
     next();
   } catch (error) { res.status(error.status || 401).json({ error: error.message === 'DATABASE_URL is not configured' ? error.message : 'Your session has expired.' }); }
 };
-const adminAuth = (req, res, next) => auth(req, res, () => req.user.role === 'admin' ? next() : res.status(403).json({ error: 'Admin access required.' }));
+const adminAuth = async (req, res, next) => {
+  try {
+    const payload = jwt.verify(req.cookies.vp_admin_token || '', jwtSecret);
+    if (!payload.admin) throw new Error('Invalid admin session');
+    const result = await query('SELECT * FROM users WHERE role = \'admin\' ORDER BY id LIMIT 1');
+    if (!result.rows[0]) throw new Error('Admin account not found');
+    req.admin = result.rows[0];
+    next();
+  } catch (error) { res.status(error.status || 401).json({ error: error.message === 'DATABASE_URL is not configured' ? error.message : 'Admin login required.' }); }
+};
 
 app.get('/api/session', auth, (req, res) => res.json({ user: safeUser(req.user) }));
 app.post('/api/register', async (req, res) => {
+  const client = pool?.connect ? await pool.connect() : null;
   try {
     const { phone, password, referralCode } = req.body;
     if (!/^03\d{9}$/.test(phone || '') || (password || '').length < 7) return res.status(400).json({ error: 'Enter a valid mobile number and a password of at least 7 characters.' });
-    const existing = await query('SELECT id FROM users WHERE phone = $1', [phone]);
-    if (existing.rows[0]) return res.status(409).json({ error: 'This mobile number is already registered.' });
-    const ref = referralCode ? (await query('SELECT id FROM users WHERE referral_code = $1', [referralCode.toUpperCase()])).rows[0] : null;
-    const code = crypto.randomBytes(4).toString('hex').toUpperCase();
-    const created = await query('INSERT INTO users(phone,password_hash,referral_code,referred_by) VALUES($1,$2,$3,$4) RETURNING *', [phone, await bcrypt.hash(password, 12), code, ref?.id || null]);
+    const db = client || { query };
+    if (client) await client.query('BEGIN');
+    const existing = await db.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    if (existing.rows[0]) { if (client) await client.query('ROLLBACK'); return res.status(409).json({ error: 'This mobile number is already registered.' }); }
+    const normalizedReferralCode = String(referralCode || '').trim().toUpperCase();
+    const ref = normalizedReferralCode ? (await db.query('SELECT id,phone FROM users WHERE referral_code = $1', [normalizedReferralCode])).rows[0] : null;
+    if (ref?.phone === phone) { if (client) await client.query('ROLLBACK'); return res.status(400).json({ error: 'You cannot use your own referral code.' }); }
+    let code;
+    do {
+      code = crypto.randomBytes(4).toString('hex').toUpperCase();
+    } while ((await db.query('SELECT 1 FROM users WHERE referral_code = $1', [code])).rowCount);
+    const created = await db.query('INSERT INTO users(phone,password_hash,referral_code,referred_by) VALUES($1,$2,$3,$4) RETURNING *', [phone, await bcrypt.hash(password, 12), code, ref?.id || null]);
+    if (ref) await db.query('UPDATE users SET total_referrals=COALESCE(total_referrals,0)+1, referral_earnings=COALESCE(referral_earnings,0)+80, balance=COALESCE(balance,0)+80 WHERE id=$1', [ref.id]);
+    if (client) await client.query('COMMIT');
     issueAuth(res, created.rows[0].id);
     res.status(201).json({ user: safeUser(created.rows[0]) });
-  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+  } catch (error) { if (client) await client.query('ROLLBACK'); res.status(error.status || 500).json({ error: error.message }); } finally { client?.release(); }
 });
 app.post('/api/login', async (req, res) => {
   try {
@@ -65,6 +85,24 @@ app.post('/api/login', async (req, res) => {
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 app.post('/api/logout', (req, res) => res.clearCookie('vp_token').json({ ok: true }));
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const identifier = String(req.body.email || '').trim().toLowerCase();
+    const configuredEmail = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+    const configuredPhone = String(process.env.ADMIN_PHONE || '').trim();
+    if (!identifier || (identifier !== configuredEmail && identifier !== configuredPhone)) return res.status(401).json({ error: 'Invalid admin credentials.' });
+    const result = await query('SELECT * FROM users WHERE role=\'admin\' AND phone=$1', [configuredPhone]);
+    if (!result.rows[0] || !(await bcrypt.compare(req.body.password || '', result.rows[0].password_hash))) return res.status(401).json({ error: 'Invalid admin credentials.' });
+    issueAdminAuth(res);
+    res.json({ ok: true });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
+});
+app.get('/api/admin/session', adminAuth, (req, res) => res.json({ authenticated: true }));
+app.post('/api/admin/logout', (req, res) => res.clearCookie('vp_admin_token').json({ ok: true }));
+app.get('/api/referrals', auth, async (req, res) => {
+  const result = await query('SELECT id,phone,created_at FROM users WHERE referred_by=$1 ORDER BY created_at DESC', [req.user.id]);
+  res.json({ total: result.rowCount, earnings: Number(req.user.referral_earnings || 0), referrals: result.rows });
+});
 app.get('/api/tasks', auth, async (req, res) => {
   const done = await query('SELECT completed_at FROM daily_tasks WHERE user_id = $1 AND task_date = CURRENT_DATE', [req.user.id]);
   res.json({ brands, completed: Boolean(done.rows[0]?.completed_at), progress: done.rows[0]?.completed_at ? 10 : 0 });

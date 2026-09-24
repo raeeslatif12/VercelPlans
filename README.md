@@ -10,4 +10,4 @@ A Vercel-ready recreation of the StarPoint-style rewards platform, branded as Ve
 
 The app serves the public site and API from one Express process. Auth uses an HTTP-only JWT cookie; users, daily tasks, withdrawals, plans, payment methods, and orders persist in PostgreSQL.
 
-Set `ADMIN_PHONE` and `ADMIN_PASSWORD` in `.env` before the first run to bootstrap an admin account. Admins can use `/admin` to create and manage plans, review payment references and proof, change order and withdrawal statuses, add payment methods, and enable or disable them.
+Set `ADMIN_PHONE`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` in `.env` before the first run to bootstrap an admin account. Admins authenticate separately at `/admin-dashboard` to create and manage plans, review payment references and proof, change order and withdrawal statuses, add payment methods, and enable or disable them.
