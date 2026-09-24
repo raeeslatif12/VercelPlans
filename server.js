@@ -185,7 +185,7 @@ const adminAuth = async (req, res, next) => {
   try {
     const payload = jwt.verify(req.cookies.vp_admin_token || '', jwtSecret);
     if (!payload.admin) throw new Error('Invalid admin session');
-    const result = await query('SELECT * FROM users WHERE role = \'admin\' AND status = \'active\' AND ($1::integer IS NULL OR id=$1) ORDER BY id LIMIT 1', [payload.userId || null]);
+    const result = await query('SELECT * FROM users WHERE role = \'admin\' AND ($1::integer IS NULL OR id=$1) ORDER BY id LIMIT 1', [payload.userId || null]);
     if (!result.rows[0]) throw new Error('Admin account not found');
     req.admin = result.rows[0];
     next();
@@ -532,12 +532,11 @@ app.post('/api/admin/password', adminAuth, async (req, res) => {
 
 app.get('/api/referrals', auth, async (req, res) => {
   const result = await query(
-    'SELECT rr.id, rr.reward_amount, rr.created_at, u.phone AS referred_phone FROM referral_rewards rr JOIN users u ON u.id = rr.referred_user_id WHERE rr.referrer_user_id = $1 ORDER BY rr.created_at DESC',
+    'SELECT rr.id, rr.reward_amount, rr.status, rr.qualified_at, rr.created_at, u.phone AS referred_phone FROM referral_rewards rr JOIN users u ON u.id = rr.referred_user_id WHERE rr.referrer_user_id = $1 ORDER BY rr.created_at DESC',
     [req.user.id]
   );
-  const total = Number((await query('SELECT COUNT(*) AS total, COALESCE(SUM(reward_amount),0) AS earnings FROM referral_rewards WHERE referrer_user_id = $1', [req.user.id])).rows[0].total || 0);
-  const earnings = Number((await query('SELECT COALESCE(SUM(reward_amount),0) AS earnings FROM referral_rewards WHERE referrer_user_id = $1', [req.user.id])).rows[0].earnings || 0);
-  res.json({ total, earnings, referrals: result.rows });
+  const summary = (await query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status IN ('qualified','rewarded','credited'))::int AS approved, COUNT(*) FILTER (WHERE status = 'registered')::int AS pending, COALESCE(SUM(CASE WHEN status IN ('qualified','rewarded','credited') THEN reward_amount ELSE 0 END),0) AS earnings FROM referral_rewards WHERE referrer_user_id = $1`, [req.user.id])).rows[0];
+  res.json({ total: Number(summary.total || 0), approved: Number(summary.approved || 0), pending: Number(summary.pending || 0), earnings: Number(summary.earnings || 0), referrals: result.rows });
 });
 
 app.get('/api/tasks', auth, async (req, res) => {
