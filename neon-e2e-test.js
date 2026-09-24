@@ -201,6 +201,10 @@ try {
   await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ max_accounts_per_device: 1 }) }, adminCookie);
   const deletedFirst = await request(`/api/admin/users/${userId}`, { method: 'DELETE' }, adminCookie);
   assert(deletedFirst.response.ok, 'first device user soft deletion failed');
+  const repeatedDelete = await request(`/api/admin/users/${userId}`, { method: 'DELETE' }, adminCookie);
+  assert(repeatedDelete.response.status === 409, 'repeated deletion did not return a controlled conflict');
+  const adminSessionAfterDelete = await request('/api/admin/session', {}, adminCookie);
+  assert(adminSessionAfterDelete.response.ok, 'admin session was lost after deletion');
   const historyAfterDelete = Number((await pool.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count);
   assert(historyAfterDelete === 2, 'device registration history was erased by account deletion');
   const blockedAfterDelete = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify(registrationBody(randomPhone(), randomPassword())) });
