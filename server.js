@@ -28,6 +28,7 @@ const defaultSettings = {
   daily_tasks_enabled: true,
   device_restriction_enabled: true,
   allow_multiple_accounts_per_device: false,
+  max_accounts_per_device: 1,
   daily_profit_enabled: true,
 };
 
@@ -264,12 +265,20 @@ const ensureDatabaseSchema = async () => {
     `ALTER TABLE orders ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT FALSE;`,
     `ALTER TABLE orders ADD COLUMN IF NOT EXISTS activated_at TIMESTAMPTZ;`,
     `ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`,
+    `ALTER TABLE plans ADD COLUMN IF NOT EXISTS return_rate NUMERIC(8,4) NOT NULL DEFAULT 0;`,
+    `UPDATE plans SET return_rate = ROUND((daily_return::numeric / NULLIF(investment, 0)) * 100, 4) WHERE return_rate = 0 AND investment > 0 AND daily_return > 0;`,
     `ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS approved_by INTEGER REFERENCES users(id);`,
     `ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;`,
     `ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS rejection_reason TEXT NOT NULL DEFAULT '';`,
     `CREATE TABLE IF NOT EXISTS app_settings (id SERIAL PRIMARY KEY, setting_name VARCHAR(120) NOT NULL UNIQUE, setting_value JSONB NOT NULL, updated_by INTEGER REFERENCES users(id), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
-    `CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_hash VARCHAR(128) NOT NULL UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
-    `CREATE TABLE IF NOT EXISTS device_exceptions (id SERIAL PRIMARY KEY, device_hash VARCHAR(128) NOT NULL UNIQUE, allowed BOOLEAN NOT NULL DEFAULT FALSE, reason TEXT NOT NULL DEFAULT '', created_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
+    `CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, device_hash VARCHAR(128) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
+    `ALTER TABLE user_devices ALTER COLUMN user_id DROP NOT NULL;`,
+    `ALTER TABLE user_devices DROP CONSTRAINT IF EXISTS user_devices_device_hash_key;`,
+    `DO $$ DECLARE fk RECORD; BEGIN FOR fk IN SELECT conname FROM pg_constraint WHERE conrelid = 'user_devices'::regclass AND contype = 'f' LOOP EXECUTE format('ALTER TABLE user_devices DROP CONSTRAINT %I', fk.conname); END LOOP; ALTER TABLE user_devices ADD CONSTRAINT user_devices_user_id_fkey FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL; END $$;`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_device_user ON user_devices(device_hash, user_id);`,
+    `CREATE TABLE IF NOT EXISTS device_exceptions (id SERIAL PRIMARY KEY, device_hash VARCHAR(128) NOT NULL UNIQUE, allowed BOOLEAN NOT NULL DEFAULT FALSE, additional_accounts INTEGER NOT NULL DEFAULT 1 CHECK (additional_accounts >= 0), reason TEXT NOT NULL DEFAULT '', created_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
+    `ALTER TABLE device_exceptions ADD COLUMN IF NOT EXISTS additional_accounts INTEGER NOT NULL DEFAULT 1;`,
+    `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'device_exceptions_additional_accounts_check') THEN ALTER TABLE device_exceptions ADD CONSTRAINT device_exceptions_additional_accounts_check CHECK (additional_accounts >= 0); END IF; END $$;`,
     `CREATE TABLE IF NOT EXISTS referral_rewards (id SERIAL PRIMARY KEY, referrer_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, referred_user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, reward_amount INTEGER NOT NULL DEFAULT 0, status VARCHAR(20) NOT NULL DEFAULT 'credited', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
     `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS qualified_order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL;`,
     `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS qualified_at TIMESTAMPTZ;`,
@@ -317,6 +326,18 @@ const ensureDatabaseSchema = async () => {
 };
 
 const generateReferralCode = () => crypto.randomBytes(4).toString('hex').toUpperCase();
+
+const calculatePlanValues = ({ investment, rate, durationDays }) => {
+  const normalizedInvestment = Number(investment);
+  const normalizedRate = Number(rate);
+  const normalizedDuration = Number(durationDays);
+  if (!Number.isFinite(normalizedInvestment) || normalizedInvestment <= 0 || !Number.isFinite(normalizedRate) || normalizedRate < 0 || !Number.isFinite(normalizedDuration) || normalizedDuration <= 0 || !Number.isInteger(normalizedDuration)) {
+    throw Object.assign(new Error('Investment, return rate, and duration must be valid positive values.'), { status: 400 });
+  }
+  const dailyReturn = Math.round(normalizedInvestment * (normalizedRate / 100));
+  const totalReturn = dailyReturn * normalizedDuration;
+  return { investment: Math.round(normalizedInvestment), rate: Number(normalizedRate.toFixed(4)), durationDays: normalizedDuration, dailyReturn, totalReturn };
+};
 
 const ensureUserDailyTasks = async userId => {
   const taskCount = Number(await readSetting('daily_task_count', 10));
@@ -414,14 +435,18 @@ app.post('/api/register', async (req, res) => {
     const db = client || { query };
     const deviceHash = createDeviceHash(req);
     const settings = await readAllSettings();
+    if (client) await client.query('BEGIN');
     if (settings.device_restriction_enabled) {
-      const existingDevice = await db.query('SELECT user_id FROM user_devices WHERE device_hash = $1 LIMIT 1', [deviceHash]);
-      const exception = await db.query('SELECT allowed FROM device_exceptions WHERE device_hash = $1 AND allowed = true LIMIT 1', [deviceHash]);
-      if (existingDevice.rows[0] && !exception.rows[0]) {
-        return res.status(409).json({ error: 'This device is already registered. Only one account is allowed per device.' });
+      await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [deviceHash]);
+      const accountCount = Number((await db.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count || 0);
+      const exception = (await db.query('SELECT allowed, additional_accounts FROM device_exceptions WHERE device_hash = $1', [deviceHash])).rows[0];
+      const configuredLimit = Math.max(1, Number(settings.max_accounts_per_device || (settings.allow_multiple_accounts_per_device ? 2 : 1)));
+      const allowedLimit = configuredLimit + (exception?.allowed ? Math.max(0, Number(exception.additional_accounts || 0)) : 0);
+      if (accountCount >= allowedLimit) {
+        if (client) await client.query('ROLLBACK');
+        return res.status(409).json({ error: `This device has reached its account limit (${accountCount}/${allowedLimit}).` });
       }
     }
-    if (client) await client.query('BEGIN');
     const normalizedReferralCode = String(referralCode || '').trim().toUpperCase();
     let referrer = null;
     if (normalizedReferralCode) {
@@ -456,7 +481,7 @@ app.post('/api/register', async (req, res) => {
     }
 
     if (deviceHash) {
-      await db.query('INSERT INTO user_devices(user_id, device_hash) VALUES($1,$2) ON CONFLICT(device_hash) DO NOTHING', [created.rows[0].id, deviceHash]);
+      await db.query('INSERT INTO user_devices(user_id, device_hash) VALUES($1,$2) ON CONFLICT(device_hash, user_id) DO NOTHING', [created.rows[0].id, deviceHash]);
     }
 
     if (referrer) {
@@ -734,21 +759,32 @@ app.get('/api/admin/plans', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/plans', adminAuth, async (req, res) => {
-  const { name, investment, dailyReturn, durationDays, totalReturn, description = '' } = req.body;
-  const result = await query(
-    'INSERT INTO plans(name, investment, daily_return, duration_days, total_return, description) VALUES($1,$2,$3,$4,$5,$6) RETURNING *',
-    [name, investment, dailyReturn, durationDays, totalReturn, description]
-  );
-  res.status(201).json({ plan: result.rows[0] });
+  try {
+    const { name, investment, rate, dailyReturn, durationDays, description = '' } = req.body || {};
+    const fallbackRate = rate === undefined ? Number(dailyReturn || 0) / Number(investment || 1) * 100 : rate;
+    const calculated = calculatePlanValues({ investment, rate: fallbackRate, durationDays });
+    if (!String(name || '').trim()) return res.status(400).json({ error: 'Plan name is required.' });
+    const result = await query(
+      'INSERT INTO plans(name, investment, return_rate, daily_return, duration_days, total_return, description) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+      [String(name).trim(), calculated.investment, calculated.rate, calculated.dailyReturn, calculated.durationDays, calculated.totalReturn, String(description || '')]
+    );
+    res.status(201).json({ plan: result.rows[0] });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
 app.patch('/api/admin/plans/:id', adminAuth, async (req, res) => {
-  const { name, investment, dailyReturn, durationDays, totalReturn, description, active } = req.body;
-  const result = await query(
-    'UPDATE plans SET name = COALESCE($1, name), investment = COALESCE($2, investment), daily_return = COALESCE($3, daily_return), duration_days = COALESCE($4, duration_days), total_return = COALESCE($5, total_return), description = COALESCE($6, description), active = COALESCE($7, active) WHERE id = $8 RETURNING *',
-    [name, investment, dailyReturn, durationDays, totalReturn, description, active, req.params.id]
-  );
-  res.json({ plan: result.rows[0] });
+  try {
+    const current = (await query('SELECT * FROM plans WHERE id = $1', [req.params.id])).rows[0];
+    if (!current) return res.status(404).json({ error: 'Plan not found.' });
+    const body = req.body || {};
+    const currentRate = Number(current.return_rate || (Number(current.daily_return || 0) / Number(current.investment || 1) * 100));
+    const calculated = calculatePlanValues({ investment: body.investment ?? current.investment, rate: body.rate ?? currentRate, durationDays: body.durationDays ?? current.duration_days });
+    const result = await query(
+      'UPDATE plans SET name = COALESCE($1, name), investment = $2, return_rate = $3, daily_return = $4, duration_days = $5, total_return = $6, description = COALESCE($7, description), active = COALESCE($8, active) WHERE id = $9 RETURNING *',
+      [body.name === undefined ? null : String(body.name).trim(), calculated.investment, calculated.rate, calculated.dailyReturn, calculated.durationDays, calculated.totalReturn, body.description === undefined ? null : String(body.description), body.active, req.params.id]
+    );
+    res.json({ plan: result.rows[0] });
+  } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 
 app.delete('/api/admin/plans/:id', adminAuth, async (req, res) => {
@@ -851,8 +887,61 @@ app.delete('/api/admin/payment-methods/:id', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/users', adminAuth, async (req, res) => {
-  const users = await query('SELECT id, phone, role, balance, total_reviews, total_referrals, referral_earnings, referred_by, created_at, status, name, email FROM users ORDER BY created_at DESC');
+  const users = await query(`SELECT u.id, u.phone, u.role, u.balance, u.total_reviews, u.total_referrals, u.referral_earnings, u.referred_by, u.created_at, u.status, u.name, u.email, u.referral_code, COUNT(DISTINCT ud.id)::int AS device_count, COUNT(DISTINCT o.id) FILTER (WHERE o.status = 'Approved' AND o.active = true)::int AS active_plan_count FROM users u LEFT JOIN user_devices ud ON ud.user_id = u.id LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id ORDER BY u.created_at DESC`);
   res.json({ users: users.rows });
+});
+
+app.get('/api/admin/devices', adminAuth, async (req, res) => {
+  const settings = await readAllSettings();
+  const devices = await query(`
+    SELECT ud.device_hash, MIN(ud.created_at) AS first_registered_at, COUNT(ud.id)::int AS account_count,
+      COALESCE(json_agg(json_build_object('id', u.id, 'name', u.name, 'phone', u.phone, 'status', u.status, 'created_at', u.created_at) ORDER BY u.created_at) FILTER (WHERE u.id IS NOT NULL), '[]'::json) AS users,
+      COALESCE(de.allowed, false) AS exception_allowed, COALESCE(de.additional_accounts, 0)::int AS additional_accounts, COALESCE(de.reason, '') AS exception_reason
+    FROM user_devices ud
+    LEFT JOIN users u ON u.id = ud.user_id
+    LEFT JOIN device_exceptions de ON de.device_hash = ud.device_hash
+    GROUP BY ud.device_hash, de.allowed, de.additional_accounts, de.reason
+    ORDER BY first_registered_at DESC
+  `);
+  res.json({ maxAccountsPerDevice: Math.max(1, Number(settings.max_accounts_per_device || 1)), devices: devices.rows });
+});
+
+app.post('/api/admin/users', adminAuth, async (req, res) => {
+  const { phone, password, email = '', name = '', status = 'active', deviceHash = '' } = req.body || {};
+  if (!/^03\d{9}$/.test(String(phone || '')) || String(password || '').length < 7) {
+    return res.status(400).json({ error: 'Enter a valid mobile number and a password of at least 7 characters.' });
+  }
+  if (!['active', 'suspended'].includes(String(status))) return res.status(400).json({ error: 'Invalid account status.' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const duplicate = await client.query('SELECT id FROM users WHERE phone = $1 OR ($2 <> \'\' AND LOWER(email) = LOWER($2)) LIMIT 1', [String(phone), String(email || '')]);
+    if (duplicate.rowCount) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'That mobile number or email is already registered.' }); }
+    if (deviceHash) {
+      const settings = await readAllSettings();
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [deviceHash]);
+      const count = Number((await client.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count || 0);
+      const exception = (await client.query('SELECT allowed, additional_accounts FROM device_exceptions WHERE device_hash = $1', [deviceHash])).rows[0];
+      const limit = Math.max(1, Number(settings.max_accounts_per_device || 1)) + (exception?.allowed ? Math.max(0, Number(exception.additional_accounts || 0)) : 0);
+      if (count >= limit) { await client.query('ROLLBACK'); return res.status(409).json({ error: `That device has reached its account limit (${count}/${limit}).` }); }
+    }
+    let created;
+    for (;;) {
+      try {
+        created = await client.query('INSERT INTO users(phone,password_hash,referral_code,role,email,name,status) VALUES($1,$2,$3,\'user\',$4,$5,$6) RETURNING *', [String(phone), await bcrypt.hash(password, 12), generateReferralCode(), String(email || '').trim(), String(name || '').trim(), status]);
+        break;
+      } catch (error) {
+        if (error.code !== '23505' || !String(error.detail || '').includes('referral_code')) throw error;
+      }
+    }
+    if (deviceHash) await client.query('INSERT INTO user_devices(user_id, device_hash) VALUES($1,$2) ON CONFLICT(device_hash, user_id) DO NOTHING', [created.rows[0].id, deviceHash]);
+    await insertAuditLogWithClient(client, req.admin.id, created.rows[0].id, 'user_created', { phone: created.rows[0].phone, name: created.rows[0].name, email: created.rows[0].email, device_assigned: Boolean(deviceHash) });
+    await client.query('COMMIT');
+    res.status(201).json({ user: safeUser(created.rows[0]) });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: error.message });
+  } finally { client.release(); }
 });
 
 app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
@@ -863,7 +952,7 @@ app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
   const tasks = await query('SELECT * FROM daily_task_assignments WHERE user_id = $1 ORDER BY task_date DESC', [req.params.id]);
   const referrals = await query('SELECT * FROM referral_rewards WHERE referrer_user_id = $1 ORDER BY created_at DESC', [req.params.id]);
   const ledger = await query('SELECT * FROM ledger_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [req.params.id]);
-  res.json({ user: user.rows[0], orders: orders.rows, withdrawals: withdrawals.rows, tasks, referrals, ledger });
+  res.json({ user: safeUser(user.rows[0]), orders: orders.rows, withdrawals: withdrawals.rows, tasks, referrals, ledger });
 });
 
 app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
@@ -884,6 +973,13 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
     if (body.status !== undefined && !['active', 'suspended'].includes(String(body.status))) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'User status must be active or suspended.' });
+    }
+    if (body.phone !== undefined || (body.email !== undefined && String(body.email || '').trim())) {
+      const duplicate = await client.query('SELECT id FROM users WHERE id <> $1 AND (($2::varchar IS NOT NULL AND phone = $2::varchar) OR ($3::varchar <> \'\' AND LOWER(email) = LOWER($3::varchar))) LIMIT 1', [req.params.id, body.phone === undefined ? null : String(body.phone).trim(), body.email === undefined ? '' : String(body.email).trim()]);
+      if (duplicate.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'That mobile number or email is already registered.' });
+      }
     }
     const previousBalance = Number(user.balance || 0);
     let nextBalance = previousBalance;
@@ -914,7 +1010,7 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
     }
     const refreshed = await client.query('SELECT * FROM users WHERE id = $1', [req.params.id]);
     await client.query('COMMIT');
-    res.json({ user: refreshed.rows[0] });
+    res.json({ user: safeUser(refreshed.rows[0]) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   } finally {
@@ -973,6 +1069,7 @@ app.put('/api/admin/settings', adminAuth, async (req, res) => {
   const updates = [];
   for (const [key, value] of Object.entries(payload)) {
     if (!allowedKeys.includes(key)) continue;
+    if (key === 'max_accounts_per_device' && (!Number.isInteger(Number(value)) || Number(value) < 1 || Number(value) > 20)) return res.status(400).json({ error: 'Maximum accounts per device must be a whole number from 1 to 20.' });
     await writeSetting(key, value, req.admin.id);
     updates.push(key);
     await insertAuditLog(req.admin.id, null, 'settings_updated', { key, value });
@@ -982,14 +1079,16 @@ app.put('/api/admin/settings', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/device-exceptions', adminAuth, async (req, res) => {
-  const { deviceHash, allowed, reason = '' } = req.body || {};
+  const { deviceHash, allowed, additionalAccounts = 1, reason = '' } = req.body || {};
   if (!deviceHash) return res.status(400).json({ error: 'A device hash is required.' });
+  const extra = Number(additionalAccounts);
+  if (!Number.isInteger(extra) || extra < 0 || extra > 50) return res.status(400).json({ error: 'Additional accounts must be a whole number from 0 to 50.' });
   await query(
-    'INSERT INTO device_exceptions(device_hash, allowed, reason, created_by, updated_at) VALUES($1,$2,$3,$4,NOW()) ON CONFLICT(device_hash) DO UPDATE SET allowed = EXCLUDED.allowed, reason = EXCLUDED.reason, created_by = EXCLUDED.created_by, updated_at = NOW()',
-    [deviceHash, Boolean(allowed), reason, req.admin.id]
+    'INSERT INTO device_exceptions(device_hash, allowed, additional_accounts, reason, created_by, updated_at) VALUES($1,$2,$3,$4,$5,NOW()) ON CONFLICT(device_hash) DO UPDATE SET allowed = EXCLUDED.allowed, additional_accounts = EXCLUDED.additional_accounts, reason = EXCLUDED.reason, created_by = EXCLUDED.created_by, updated_at = NOW()',
+    [deviceHash, Boolean(allowed), extra, reason, req.admin.id]
   );
-  await insertAuditLog(req.admin.id, null, 'device_exception_updated', { device_hash: deviceHash, allowed: Boolean(allowed), reason });
-  res.json({ ok: true });
+  await insertAuditLog(req.admin.id, null, 'device_exception_updated', { device_hash: deviceHash, allowed: Boolean(allowed), additional_accounts: extra, reason });
+  res.json({ ok: true, additionalAccounts: extra });
 });
 
 app.post('/api/cron/daily-profit', async (req, res) => {

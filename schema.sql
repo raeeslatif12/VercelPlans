@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS plans (
   name VARCHAR(120) NOT NULL UNIQUE,
   investment INTEGER NOT NULL CHECK (investment > 0),
   daily_return INTEGER NOT NULL CHECK (daily_return >= 0),
+  return_rate NUMERIC(8,4) NOT NULL DEFAULT 0 CHECK (return_rate >= 0),
   duration_days INTEGER NOT NULL CHECK (duration_days > 0),
   total_return INTEGER NOT NULL CHECK (total_return >= 0),
   description TEXT NOT NULL DEFAULT '',
@@ -87,15 +88,17 @@ CREATE TABLE IF NOT EXISTS app_settings (
 
 CREATE TABLE IF NOT EXISTS user_devices (
   id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  device_hash VARCHAR(128) NOT NULL UNIQUE,
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  device_hash VARCHAR(128) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_device_user ON user_devices(device_hash, user_id);
 
 CREATE TABLE IF NOT EXISTS device_exceptions (
   id SERIAL PRIMARY KEY,
   device_hash VARCHAR(128) NOT NULL UNIQUE,
   allowed BOOLEAN NOT NULL DEFAULT FALSE,
+  additional_accounts INTEGER NOT NULL DEFAULT 1 CHECK (additional_accounts >= 0),
   reason TEXT NOT NULL DEFAULT '',
   created_by INTEGER REFERENCES users(id),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -190,5 +193,6 @@ VALUES
   ('daily_tasks_enabled', 'true'),
   ('device_restriction_enabled', 'true'),
   ('allow_multiple_accounts_per_device', 'false'),
+  ('max_accounts_per_device', '1'),
   ('daily_profit_enabled', 'true')
 ON CONFLICT (setting_name) DO NOTHING;

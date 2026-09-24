@@ -18,12 +18,19 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
 
 let userId;
 let secondUserId;
+let deviceSecondId;
+let deviceThirdId;
+let adminCreatedId;
+let adminCreatedPhone;
+let adminCreatedPassword;
+let e2eDeviceHash;
 let orderId;
 let qualifiedOrderId;
 let withdrawalId;
 let tempPlanId;
 let tempMethodId;
 try {
+  await pool.query("INSERT INTO app_settings(setting_name, setting_value) VALUES('max_accounts_per_device', '1') ON CONFLICT(setting_name) DO UPDATE SET setting_value = '1'");
   const phone = randomPhone();
   const password = randomPassword();
   const testDeviceIp = `198.51.100.${crypto.randomInt(1, 250)}`;
@@ -31,6 +38,8 @@ try {
   assert(registered.response.status === 201, `registration failed (${registered.response.status}): ${registered.data.error || 'no error returned'}`);
   userId = registered.data.user.id;
   let userCookie = registered.cookie;
+  const blockedSameDevice = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword() }) });
+  assert(blockedSameDevice.response.status === 409, 'same-device registration bypassed the default limit');
   const referralCode = registered.data.user.referralCode;
   assert(/^[A-F0-9]{8}$/.test(referralCode), `invalid referral code format: ${referralCode}`);
   const invalidReferral = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.102.${crypto.randomInt(1, 250)}` }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword(), referralCode: 'INVALID1' }) });
@@ -87,6 +96,27 @@ try {
   const adminCookie = adminLogin.cookie;
   const adminSession = await request('/api/admin/session', {}, adminCookie);
   assert(adminSession.response.ok, 'admin session failed');
+  const limitUpdate = await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ max_accounts_per_device: 2 }) }, adminCookie);
+  assert(limitUpdate.response.ok && Number(limitUpdate.data.settings.max_accounts_per_device) === 2, 'admin device limit update failed');
+  const sameDeviceSecond = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword() }) });
+  assert(sameDeviceSecond.response.status === 201, 'admin limit of two did not allow the second device account');
+  deviceSecondId = sameDeviceSecond.data.user.id;
+  const deviceHash = (await pool.query('SELECT device_hash FROM user_devices WHERE user_id = $1 LIMIT 1', [userId])).rows[0].device_hash;
+  e2eDeviceHash = deviceHash;
+  const deviceCountAfterSecond = Number((await pool.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count);
+  assert(deviceCountAfterSecond === 2, 'device registration history did not record both accounts');
+  adminCreatedPhone = randomPhone();
+  adminCreatedPassword = randomPassword();
+  const adminCreated = await post('/api/admin/users', { name: 'E2E Created User', phone: adminCreatedPhone, email: `e2e-${Date.now()}@example.invalid`, password: adminCreatedPassword, status: 'active' }, adminCookie);
+  assert(adminCreated.response.status === 201 && adminCreated.data.user && !adminCreated.data.user.password_hash, 'admin-created user response exposed an invalid password field');
+  adminCreatedId = adminCreated.data.user.id;
+  const createdLogin = await post('/api/login', { phone: adminCreatedPhone, password: adminCreatedPassword });
+  assert(createdLogin.response.ok, 'admin-created user could not log in');
+  const resetPassword = randomPassword();
+  const reset = await patch(`/api/admin/users/${adminCreatedId}`, { password: resetPassword }, adminCookie);
+  assert(reset.response.ok && !reset.data.user.password_hash, 'admin password reset exposed password data');
+  const resetLogin = await post('/api/login', { phone: adminCreatedPhone, password: resetPassword });
+  assert(resetLogin.response.ok, 'admin password reset did not work');
   const referredOrder = await post('/api/orders', { planId: plan.id, paymentMethodId: details.data.paymentMethods[0].id, paymentReference: 'E2E-REFERRAL-ORDER', paymentDetails: 'E2E referral wallet', paymentProof: 'data:image/png;base64,iVBORw0KGgo=' }, referred.cookie);
   assert(referredOrder.response.status === 201, 'referred order creation failed');
   qualifiedOrderId = referredOrder.data.orderId;
@@ -123,15 +153,28 @@ try {
   const normalDeleteAttempt = await request(`/api/admin/users/${secondUserId}`, { method: 'DELETE' }, referred.cookie);
   assert([401, 403].includes(normalDeleteAttempt.response.status), 'normal user reached admin deletion API');
   const editedUser = await patch(`/api/admin/users/${secondUserId}`, { name: 'E2E Managed User', email: 'e2e-managed@example.invalid' }, adminCookie);
-  assert(editedUser.response.ok && editedUser.data.user.name === 'E2E Managed User', 'admin user edit failed');
+  assert(editedUser.response.ok && editedUser.data.user.name === 'E2E Managed User', `admin user edit failed (${editedUser.response.status}): ${editedUser.data.error || 'unexpected response'}`);
 
-  const tempPlan = await post('/api/admin/plans', { name: `E2E ${Date.now()}`, investment: 1234, dailyReturn: 50, durationDays: 30, totalReturn: 1500, description: 'Temporary test plan' }, adminCookie);
+  const tempPlan = await post('/api/admin/plans', { name: `E2E ${Date.now()}`, investment: 10000, rate: 5, durationDays: 30, description: 'Temporary test plan' }, adminCookie);
   assert(tempPlan.response.status === 201, 'admin plan creation failed');
   tempPlanId = tempPlan.data.plan.id;
+  assert(Number(tempPlan.data.plan.daily_return) === 500 && Number(tempPlan.data.plan.total_return) === 15000 && Number(tempPlan.data.plan.return_rate) === 5, 'backend plan calculation is incorrect');
   await patch(`/api/admin/plans/${tempPlanId}`, { active: false }, adminCookie);
   const tempMethod = await post('/api/admin/payment-methods', { name: `E2E Method ${Date.now()}`, details: 'Temporary test method' }, adminCookie);
   assert(tempMethod.response.status === 201, 'admin payment method creation failed');
   tempMethodId = tempMethod.data.method.id;
+  const deletedFirst = await request(`/api/admin/users/${userId}`, { method: 'DELETE' }, adminCookie);
+  assert(deletedFirst.response.ok, 'first device user soft deletion failed');
+  const historyAfterDelete = Number((await pool.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count);
+  assert(historyAfterDelete === 2, 'device registration history was erased by account deletion');
+  const blockedAfterDelete = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword() }) });
+  assert(blockedAfterDelete.response.status === 409, 'deleted account incorrectly freed its device');
+  const exception = await request('/api/admin/device-exceptions', { method: 'POST', body: JSON.stringify({ deviceHash, allowed: true, additionalAccounts: 1, reason: 'E2E approved exception' }) }, adminCookie);
+  assert(exception.response.ok, 'admin device exception failed');
+  const sameDeviceThird = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone: randomPhone(), password: randomPassword() }) });
+  assert(sameDeviceThird.response.status === 201, 'authorized device exception did not allow registration');
+  deviceThirdId = sameDeviceThird.data.user.id;
+  await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ max_accounts_per_device: 1 }) }, adminCookie);
   const deletedUser = await request(`/api/admin/users/${secondUserId}`, { method: 'DELETE' }, adminCookie);
   assert(deletedUser.response.ok && deletedUser.data.status === 'deleted', 'admin soft deletion failed');
   const deletedRow = (await pool.query('SELECT status,deleted_at FROM users WHERE id=$1', [secondUserId])).rows[0];
@@ -147,8 +190,12 @@ try {
   if (tempMethodId) await pool.query('DELETE FROM payment_methods WHERE id=$1', [tempMethodId]);
   if (tempPlanId) await pool.query('DELETE FROM plans WHERE id=$1', [tempPlanId]);
   if (qualifiedOrderId) { await pool.query('UPDATE referral_rewards SET qualified_order_id = NULL WHERE qualified_order_id = $1', [qualifiedOrderId]); await pool.query('DELETE FROM orders WHERE id=$1', [qualifiedOrderId]); }
-    if (userId || secondUserId) await pool.query('DELETE FROM admin_audit_log WHERE target_user_id = ANY($1::int[]) OR actor_user_id = ANY($1::int[])', [[userId, secondUserId].filter(Boolean)]);
-  if (secondUserId) await pool.query('DELETE FROM users WHERE id=$1', [secondUserId]);
-  if (userId) await pool.query('DELETE FROM users WHERE id=$1', [userId]);
+  const cleanupIds = [userId, secondUserId, deviceSecondId, deviceThirdId, adminCreatedId].filter(Boolean);
+  if (cleanupIds.length) {
+    await pool.query('DELETE FROM user_devices WHERE user_id = ANY($1::int[])', [cleanupIds]);
+    await pool.query('DELETE FROM admin_audit_log WHERE target_user_id = ANY($1::int[]) OR actor_user_id = ANY($1::int[])', [cleanupIds]);
+    await pool.query('DELETE FROM users WHERE id = ANY($1::int[])', [cleanupIds]);
+  }
+  if (e2eDeviceHash) await pool.query('DELETE FROM device_exceptions WHERE device_hash = $1', [e2eDeviceHash]);
   await pool.end();
 }
