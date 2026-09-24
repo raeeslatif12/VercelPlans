@@ -29,7 +29,7 @@ const query = async (text, values = []) => {
 };
 const safeUser = row => ({ id: row.id, phone: row.phone, role: row.role || 'user', referralCode: row.referral_code, balance: row.balance, totalReviews: row.total_reviews, totalReferrals: row.total_referrals, referralEarnings: row.referral_earnings });
 const issueAuth = (res, userId) => res.cookie('vp_token', jwt.sign({ userId }, jwtSecret, { expiresIn: '7d' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 604800000 });
-const issueAdminAuth = res => res.cookie('vp_admin_token', jwt.sign({ admin: true }, jwtSecret, { expiresIn: '8h' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 28800000 });
+const issueAdminAuth = (res, userId) => res.cookie('vp_admin_token', jwt.sign({ admin: true, userId }, jwtSecret, { expiresIn: '8h' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 28800000 });
 const auth = async (req, res, next) => {
   try {
     const token = req.cookies.vp_token;
@@ -45,7 +45,7 @@ const adminAuth = async (req, res, next) => {
   try {
     const payload = jwt.verify(req.cookies.vp_admin_token || '', jwtSecret);
     if (!payload.admin) throw new Error('Invalid admin session');
-    const result = await query('SELECT * FROM users WHERE role = \'admin\' ORDER BY id LIMIT 1');
+    const result = await query('SELECT * FROM users WHERE role = \'admin\' AND ($1::integer IS NULL OR id=$1) ORDER BY id LIMIT 1', [payload.userId || null]);
     if (!result.rows[0]) throw new Error('Admin account not found');
     req.admin = result.rows[0];
     next();
@@ -97,12 +97,17 @@ app.post('/api/admin/login', async (req, res) => {
       if (await bcrypt.compare(req.body.password || '', row.password_hash)) { admin = row; break; }
     }
     if (!admin) return res.status(401).json({ error: 'Invalid admin credentials.' });
-    issueAdminAuth(res);
+    issueAdminAuth(res, admin.id);
     res.json({ ok: true });
   } catch (error) { res.status(error.status || 500).json({ error: error.message }); }
 });
 app.get('/api/admin/session', adminAuth, (req, res) => res.json({ authenticated: true }));
 app.post('/api/admin/logout', (req, res) => res.clearCookie('vp_admin_token').json({ ok: true }));
+app.post('/api/admin/password', adminAuth, async (req, res) => {
+  if ((req.body.password || '').length < 7 || req.body.password !== req.body.confirmPassword) return res.status(400).json({ error: 'Passwords must match and be at least 7 characters.' });
+  await query('UPDATE users SET password_hash=$1 WHERE id=$2', [await bcrypt.hash(req.body.password, 12), req.admin.id]);
+  res.json({ ok: true });
+});
 app.get('/api/referrals', auth, async (req, res) => {
   const result = await query('SELECT id,phone,created_at FROM users WHERE referred_by=$1 ORDER BY created_at DESC', [req.user.id]);
   res.json({ total: result.rowCount, earnings: Number(req.user.referral_earnings || 0), referrals: result.rows });
