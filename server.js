@@ -175,33 +175,10 @@ const getUserReferralStats = async userId => {
 
 const reconcileReferralAggregates = async () => {
   await query(`
-    WITH referral_totals AS (
-      SELECT rr.referrer_user_id AS user_id,
-             COUNT(*)::int AS total_referrals,
-             COALESCE(SUM(CASE WHEN lt.source = 'referral_reward' AND lt.type = 'credit' AND lt.status = 'posted' THEN lt.amount ELSE 0 END), 0)::int AS referral_earnings
-      FROM referral_rewards rr
-      LEFT JOIN ledger_transactions lt
-        ON lt.user_id = rr.referrer_user_id
-       AND lt.source = 'referral_reward'
-       AND lt.type = 'credit'
-       AND lt.status = 'posted'
-      GROUP BY rr.referrer_user_id
-    )
-    UPDATE users u
-    SET total_referrals = COALESCE(rt.total_referrals, 0),
-        referral_earnings = COALESCE(rt.referral_earnings, 0),
-        updated_at = NOW()
-    FROM referral_totals rt
-    WHERE u.id = rt.user_id
-  `);
-  await query(`
     UPDATE users u
     SET total_referrals = COALESCE((SELECT COUNT(*)::int FROM referral_rewards rr WHERE rr.referrer_user_id = u.id), 0),
         referral_earnings = COALESCE((SELECT SUM(amount)::int FROM ledger_transactions lt WHERE lt.user_id = u.id AND lt.source = 'referral_reward' AND lt.type = 'credit' AND lt.status = 'posted'), 0),
         updated_at = NOW()
-    WHERE u.id NOT IN (
-      SELECT DISTINCT referrer_user_id FROM referral_rewards
-    )
   `);
 };
 
@@ -405,7 +382,6 @@ const rewardReferralForApprovedOrder = async (client, orderId, referredUserId) =
     reference: `referral:${reward.id}`,
     metadata: { referred_user_id: referredUserId, qualified_order_id: orderId, reward_amount: reward.reward_amount },
   });
-  await reconcileReferralAggregates();
   return true;
 };
 
@@ -526,7 +502,10 @@ const ensureDatabaseSchema = async () => {
   await query('ALTER TABLE referral_rewards ALTER COLUMN status SET DEFAULT \'registered\'');
   await reconcileReferralAggregates();
 
-  for (const [name, value] of Object.entries(defaultSettings)) await insertDefaultSetting(name, value);
+  const defaultSettingEntries = Object.entries(defaultSettings);
+  const defaultSettingValues = defaultSettingEntries.flatMap(([name, value]) => [name, JSON.stringify(value)]);
+  const defaultSettingPlaceholders = defaultSettingEntries.map((_, index) => `($${index * 2 + 1},$${index * 2 + 2})`).join(',');
+  await query(`INSERT INTO app_settings(setting_name, setting_value) VALUES${defaultSettingPlaceholders} ON CONFLICT(setting_name) DO NOTHING`, defaultSettingValues);
   await query("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_active_unique ON users (lower(trim(email))) WHERE status != 'deleted' AND NULLIF(trim(email), '') IS NOT NULL");
 };
 
@@ -1031,6 +1010,19 @@ app.post('/api/profile/password', auth, async (req, res) => {
   }
   await query('UPDATE users SET password_hash = $1 WHERE id = $2', [await bcrypt.hash(req.body.password, 12), req.user.id]);
   res.json({ ok: true });
+});
+
+app.patch('/api/profile', auth, async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Enter a valid email address or leave the email blank.' });
+  }
+  if (email) {
+    const duplicate = await query('SELECT id FROM users WHERE id <> $1 AND status <> \'deleted\' AND LOWER(email) = $2 LIMIT 1', [req.user.id, email]);
+    if (duplicate.rowCount) return res.status(409).json({ error: 'That email address is already registered.' });
+  }
+  const updated = await query('UPDATE users SET email = $1, updated_at = NOW() WHERE id = $2 RETURNING *', [email, req.user.id]);
+  res.json({ user: safeUser(updated.rows[0]) });
 });
 
 app.get('/api/plans', auth, async (req, res) => {
