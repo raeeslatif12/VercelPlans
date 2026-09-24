@@ -1397,7 +1397,7 @@ app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
       return res.status(400).json({ error: 'Enter a valid email address or leave the email blank.' });
     }
     if (body.phone !== undefined || (body.email !== undefined && String(body.email || '').trim())) {
-      const duplicate = await client.query('SELECT id FROM users WHERE id <> $1 AND (($2::varchar IS NOT NULL AND phone = $2::varchar) OR ($3::varchar <> \'\' AND LOWER(email) = LOWER($3::varchar))) LIMIT 1', [req.params.id, body.phone === undefined ? null : String(body.phone).trim(), body.email === undefined ? '' : String(body.email).trim()]);
+      const duplicate = await client.query('SELECT id FROM users WHERE id <> $1 AND status <> \'deleted\' AND (($2::varchar IS NOT NULL AND phone = $2::varchar) OR ($3::varchar <> \'\' AND LOWER(TRIM(email)) = LOWER(TRIM($3::varchar)))) LIMIT 1', [req.params.id, body.phone === undefined ? null : String(body.phone).trim(), body.email === undefined ? '' : String(body.email).trim()]);
       if (duplicate.rowCount) {
         await client.query('ROLLBACK');
         return res.status(409).json({ error: 'That mobile number or email is already registered.' });
