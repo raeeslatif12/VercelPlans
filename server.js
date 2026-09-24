@@ -89,6 +89,15 @@ const parseSettingValue = (value, fallback) => {
   }
 };
 
+const getDeviceLimit = (settings, exception = null) => {
+  const configuredLimit = Number.isFinite(Number(settings.max_accounts_per_device))
+    ? Number(settings.max_accounts_per_device)
+    : Number(settings.allow_multiple_accounts_per_device ? 2 : 1);
+  const baseLimit = Math.max(1, configuredLimit);
+  const extra = exception?.allowed ? Math.max(0, Number(exception.additional_accounts || 0)) : 0;
+  return baseLimit + extra;
+};
+
 const readSetting = async (name, fallback) => {
   const result = await query('SELECT setting_value FROM app_settings WHERE setting_name = $1', [name]);
   if (!result.rows[0]) return fallback;
@@ -143,6 +152,90 @@ const safeUser = row => ({
   email: row.email || '',
   status: row.status || 'active',
 });
+
+const getUserReferralStats = async userId => {
+  const summary = (await query(`
+    SELECT
+      COUNT(*)::int AS total_referrals,
+      COALESCE(SUM(CASE WHEN status IN ('qualified','rewarded','credited') THEN reward_amount ELSE 0 END), 0)::int AS approved_earnings
+    FROM referral_rewards
+    WHERE referrer_user_id = $1
+  `, [userId])).rows[0] || {};
+  const ledger = (await query(`
+    SELECT COALESCE(SUM(amount), 0)::int AS referral_earnings
+    FROM ledger_transactions
+    WHERE user_id = $1 AND type = 'credit' AND source = 'referral_reward' AND status = 'posted'
+  `, [userId])).rows[0] || {};
+  return {
+    totalReferrals: Number(summary.total_referrals || 0),
+    approvedReferralEarnings: Number(summary.approved_earnings || 0),
+    referralEarnings: Number(ledger.referral_earnings || 0),
+  };
+};
+
+const reconcileReferralAggregates = async () => {
+  await query(`
+    WITH referral_totals AS (
+      SELECT rr.referrer_user_id AS user_id,
+             COUNT(*)::int AS total_referrals,
+             COALESCE(SUM(CASE WHEN lt.source = 'referral_reward' AND lt.type = 'credit' AND lt.status = 'posted' THEN lt.amount ELSE 0 END), 0)::int AS referral_earnings
+      FROM referral_rewards rr
+      LEFT JOIN ledger_transactions lt
+        ON lt.user_id = rr.referrer_user_id
+       AND lt.source = 'referral_reward'
+       AND lt.type = 'credit'
+       AND lt.status = 'posted'
+      GROUP BY rr.referrer_user_id
+    )
+    UPDATE users u
+    SET total_referrals = COALESCE(rt.total_referrals, 0),
+        referral_earnings = COALESCE(rt.referral_earnings, 0),
+        updated_at = NOW()
+    FROM referral_totals rt
+    WHERE u.id = rt.user_id
+  `);
+  await query(`
+    UPDATE users u
+    SET total_referrals = COALESCE((SELECT COUNT(*)::int FROM referral_rewards rr WHERE rr.referrer_user_id = u.id), 0),
+        referral_earnings = COALESCE((SELECT SUM(amount)::int FROM ledger_transactions lt WHERE lt.user_id = u.id AND lt.source = 'referral_reward' AND lt.type = 'credit' AND lt.status = 'posted'), 0),
+        updated_at = NOW()
+    WHERE u.id NOT IN (
+      SELECT DISTINCT referrer_user_id FROM referral_rewards
+    )
+  `);
+};
+
+const creditPlanProfit = async (client, order, profitDate = new Date().toISOString().slice(0, 10), amountOverride = null) => {
+  const profitAmount = Number(amountOverride ?? Number(order.daily_return || 0) ?? 0);
+  if (!profitAmount || !Number.isFinite(profitAmount)) return { inserted: false, amount: 0 };
+
+  const existing = await client.query(
+    'SELECT id FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND profit_date = $3',
+    [order.user_id, order.id, profitDate]
+  );
+  if (existing.rowCount) return { inserted: false, amount: profitAmount };
+
+  const inserted = await client.query(
+    'INSERT INTO plan_daily_profits(user_id, order_id, plan_id, profit_date, profit_amount, status) VALUES($1,$2,$3,$4,$5,\'posted\') ON CONFLICT(user_id, order_id, profit_date) DO NOTHING RETURNING id',
+    [order.user_id, order.id, order.plan_id, profitDate, profitAmount]
+  );
+
+  if (!inserted.rowCount) return { inserted: false, amount: profitAmount };
+
+  const reference = `plan_profit:${order.id}:${profitDate}`;
+  await client.query('UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE id = $2', [profitAmount, order.user_id]);
+  await createLedgerEntry(client, order.user_id, profitAmount, 'credit', 'daily_plan_profit', reference, { order_id: order.id, plan_id: order.plan_id, profit_date: profitDate, amount: profitAmount });
+  await createUserNotification(client, order.user_id, {
+    title: 'Congratulations!',
+    message: 'Plan earning credited successfully.',
+    amount: profitAmount,
+    reason: 'Plan earning',
+    source: 'daily_plan_profit',
+    reference,
+    metadata: { order_id: order.id, plan_id: order.plan_id, profit_date: profitDate, amount: profitAmount },
+  });
+  return { inserted: true, amount: profitAmount };
+};
 
 const buildUserPlanSummary = async (userId, now = new Date()) => {
   const activeOrders = await query(`
@@ -312,6 +405,7 @@ const rewardReferralForApprovedOrder = async (client, orderId, referredUserId) =
     reference: `referral:${reward.id}`,
     metadata: { referred_user_id: referredUserId, qualified_order_id: orderId, reward_amount: reward.reward_amount },
   });
+  await reconcileReferralAggregates();
   return true;
 };
 
@@ -430,6 +524,7 @@ const ensureDatabaseSchema = async () => {
   await query('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code_unique ON users(referral_code)');
   await query('ALTER TABLE users ALTER COLUMN referral_code SET NOT NULL');
   await query('ALTER TABLE referral_rewards ALTER COLUMN status SET DEFAULT \'registered\'');
+  await reconcileReferralAggregates();
 
   for (const [name, value] of Object.entries(defaultSettings)) await insertDefaultSetting(name, value);
   await query("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_active_unique ON users (lower(trim(email))) WHERE status != 'deleted' AND NULLIF(trim(email), '') IS NOT NULL");
@@ -551,13 +646,15 @@ const processDailyPlanProfits = async (targetDate = new Date()) => {
 
 app.get('/api/session', auth, async (req, res) => {
   const settings = await readAllSettings();
-  res.json({ user: { ...safeUser(req.user), minimumWithdrawalAmount: Number(settings.minimum_withdrawal_amount || 0) } });
+  const referralStats = await getUserReferralStats(req.user.id);
+  res.json({ user: { ...safeUser(req.user), totalReferrals: referralStats.totalReferrals, referralEarnings: referralStats.referralEarnings, minimumWithdrawalAmount: Number(settings.minimum_withdrawal_amount || 0) } });
 });
 
 app.get('/api/dashboard', auth, async (req, res) => {
   const dashboard = await buildUserDashboardData(req.user.id);
+  const referralStats = await getUserReferralStats(req.user.id);
   res.json({
-    user: safeUser(req.user),
+    user: { ...safeUser(req.user), totalReferrals: referralStats.totalReferrals, referralEarnings: referralStats.referralEarnings },
     activePlans: dashboard.activePlans,
     pendingOrder: dashboard.pendingOrder,
     hasActivePlan: dashboard.hasActivePlan,
@@ -584,8 +681,7 @@ app.post('/api/register', async (req, res) => {
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [deviceHash]);
       const accountCount = Number((await db.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count || 0);
       const exception = (await db.query('SELECT allowed, additional_accounts FROM device_exceptions WHERE device_hash = $1', [deviceHash])).rows[0];
-      const configuredLimit = Math.max(1, Number(settings.max_accounts_per_device || (settings.allow_multiple_accounts_per_device ? 2 : 1)));
-      const allowedLimit = configuredLimit + (exception?.allowed ? Math.max(0, Number(exception.additional_accounts || 0)) : 0);
+      const allowedLimit = getDeviceLimit(settings, exception);
       if (accountCount >= allowedLimit) {
         if (client) await client.query('ROLLBACK');
         return res.status(409).json({ error: `This device has reached its account limit (${accountCount}/${allowedLimit}).` });
@@ -728,8 +824,9 @@ app.get('/api/referrals', auth, async (req, res) => {
     'SELECT rr.id, rr.reward_amount, rr.status, rr.qualified_at, rr.created_at, COALESCE(NULLIF(CONCAT_WS(\' \', u.first_name, u.last_name), \'\'), u.name, u.phone) AS referred_phone, u.phone AS referred_mobile, u.first_name AS referred_first_name, u.last_name AS referred_last_name, u.name AS referred_name FROM referral_rewards rr JOIN users u ON u.id = rr.referred_user_id WHERE rr.referrer_user_id = $1 ORDER BY rr.created_at DESC',
     [req.user.id]
   );
-  const summary = (await query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status IN ('qualified','rewarded','credited'))::int AS approved, COUNT(*) FILTER (WHERE status = 'registered')::int AS pending, COALESCE(SUM(CASE WHEN status IN ('qualified','rewarded','credited') THEN reward_amount ELSE 0 END),0) AS earnings FROM referral_rewards WHERE referrer_user_id = $1`, [req.user.id])).rows[0];
-  res.json({ total: Number(summary.total || 0), approved: Number(summary.approved || 0), pending: Number(summary.pending || 0), earnings: Number(summary.earnings || 0), referrals: result.rows });
+  const summary = (await query(`SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status IN ('qualified','rewarded','credited'))::int AS approved, COUNT(*) FILTER (WHERE status = 'registered')::int AS pending FROM referral_rewards WHERE referrer_user_id = $1`, [req.user.id])).rows[0];
+  const referralStats = await getUserReferralStats(req.user.id);
+  res.json({ total: Number(summary.total || 0), approved: Number(summary.approved || 0), pending: Number(summary.pending || 0), earnings: referralStats.referralEarnings, referrals: result.rows });
 });
 
 app.get('/api/tasks', auth, async (req, res) => {
@@ -1043,14 +1140,14 @@ app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
     if (nextStatus === 'Approved' && currentOrder.rows[0].status !== 'Approved' && await readSetting('daily_profit_enabled', true)) {
       const plan = await client.query('SELECT daily_return FROM plans WHERE id = $1', [currentOrder.rows[0].plan_id]);
       const profitDate = new Date().toISOString().slice(0, 10);
-      const firstDayProfit = await client.query(
-        'INSERT INTO plan_daily_profits(user_id, order_id, plan_id, profit_date, profit_amount, status) VALUES($1,$2,$3,$4,$5,\'posted\') ON CONFLICT(user_id, order_id, profit_date) DO NOTHING RETURNING id',
-        [currentOrder.rows[0].user_id, currentOrder.rows[0].id, currentOrder.rows[0].plan_id, profitDate, Number(plan.rows[0]?.daily_return || 0)]
-      );
-      if (firstDayProfit.rowCount) {
-        const amount = Number(plan.rows[0]?.daily_return || 0);
-        await client.query('UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE id = $2', [amount, currentOrder.rows[0].user_id]);
-        await createLedgerEntry(client, currentOrder.rows[0].user_id, amount, 'credit', 'daily_plan_profit', `plan_profit:${currentOrder.rows[0].id}:${profitDate}`, { order_id: currentOrder.rows[0].id, plan_id: currentOrder.rows[0].plan_id, profit_date: profitDate, amount });
+      const existingProfit = await client.query('SELECT id FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND profit_date = $3', [currentOrder.rows[0].user_id, currentOrder.rows[0].id, profitDate]);
+      if (!existingProfit.rowCount) {
+        await creditPlanProfit(client, {
+          user_id: currentOrder.rows[0].user_id,
+          id: currentOrder.rows[0].id,
+          plan_id: currentOrder.rows[0].plan_id,
+          daily_return: Number(plan.rows[0]?.daily_return || 0),
+        }, profitDate, Number(plan.rows[0]?.daily_return || 0));
       }
     }
     await client.query('COMMIT');
@@ -1167,7 +1264,7 @@ app.post('/api/admin/users', adminAuth, async (req, res) => {
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [deviceHash]);
       const count = Number((await client.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count || 0);
       const exception = (await client.query('SELECT allowed, additional_accounts FROM device_exceptions WHERE device_hash = $1', [deviceHash])).rows[0];
-      const limit = Math.max(1, Number(settings.max_accounts_per_device || 1)) + (exception?.allowed ? Math.max(0, Number(exception.additional_accounts || 0)) : 0);
+      const limit = getDeviceLimit(settings, exception);
       if (count >= limit) { await client.query('ROLLBACK'); return res.status(409).json({ error: `That device has reached its account limit (${count}/${limit}).` }); }
     }
     let created;
