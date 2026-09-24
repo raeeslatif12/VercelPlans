@@ -1,0 +1,5 @@
+.env.example
+.env
+node_modules
+neon-e2e-test.js
+db-init.js
