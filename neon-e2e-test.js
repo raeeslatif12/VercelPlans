@@ -1,0 +1,108 @@
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import pg from 'pg';
+
+const base = `http://localhost:${process.env.PORT || 3000}`;
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const randomPhone = () => `03${crypto.randomInt(100000000, 999999999)}`;
+const randomPassword = () => `${crypto.randomBytes(18).toString('base64url')}Aa1!`;
+const request = async (path, options = {}, cookie = '') => {
+  const response = await fetch(`${base}${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(cookie ? { Cookie: cookie } : {}), ...(options.headers || {}) } });
+  const data = await response.json().catch(() => ({}));
+  const setCookie = response.headers.get('set-cookie');
+  return { response, data, cookie: setCookie ? setCookie.split(';')[0] : cookie };
+};
+const post = (path, body, cookie) => request(path, { method: 'POST', body: JSON.stringify(body) }, cookie);
+const patch = (path, body, cookie) => request(path, { method: 'PATCH', body: JSON.stringify(body) }, cookie);
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+
+let userId;
+let secondUserId;
+let orderId;
+let withdrawalId;
+let tempPlanId;
+let tempMethodId;
+try {
+  const phone = randomPhone();
+  const password = randomPassword();
+  const registered = await post('/api/register', { phone, password });
+  assert(registered.response.status === 201, 'registration failed');
+  userId = registered.data.user.id;
+  let userCookie = registered.cookie;
+  const session = await request('/api/session', {}, userCookie);
+  assert(session.data.user.id === userId, 'session failed');
+  const loggedOut = await post('/api/logout', {}, userCookie);
+  assert(loggedOut.response.ok, 'logout failed');
+  const loggedIn = await post('/api/login', { phone, password });
+  assert(loggedIn.response.ok, 'login failed');
+  userCookie = loggedIn.cookie;
+
+  const tasks = await request('/api/tasks', {}, userCookie);
+  assert(tasks.data.brands.length === 10, 'tasks did not load');
+  const completed = await post('/api/tasks/complete', {}, userCookie);
+  assert(completed.response.ok, 'task completion failed');
+  const balanceAfterTask = (await pool.query('SELECT balance FROM users WHERE id=$1', [userId])).rows[0].balance;
+  assert(balanceAfterTask === 350, 'task reward was not persisted');
+
+  const plans = await request('/api/plans', {}, userCookie);
+  assert(plans.data.plans.length > 0, 'plans did not load from PostgreSQL');
+  const plan = plans.data.plans[0];
+  const details = await request(`/api/plans/${plan.id}`, {}, userCookie);
+  assert(details.data.paymentMethods.length > 0, 'payment methods did not load');
+  const createdOrder = await post('/api/orders', { planId: plan.id, paymentMethodId: details.data.paymentMethods[0].id, paymentReference: 'E2E-REFERENCE', paymentDetails: 'E2E wallet details', paymentProof: 'https://example.com/e2e-proof' }, userCookie);
+  assert(createdOrder.response.status === 201, 'order creation failed');
+  orderId = createdOrder.data.orderId;
+  const dbOrder = (await pool.query('SELECT user_id,status FROM orders WHERE id=$1', [orderId])).rows[0];
+  assert(dbOrder.user_id === userId && dbOrder.status === 'Pending', 'order was not persisted as pending');
+  const userOrders = await request('/api/orders', {}, userCookie);
+  assert(userOrders.data.orders.some(order => order.id === orderId), 'user order list failed');
+
+  const secondPhone = randomPhone();
+  const secondRegistered = await post('/api/register', { phone: secondPhone, password: randomPassword() });
+  secondUserId = secondRegistered.data.user.id;
+  const secondOrders = await request('/api/orders', {}, secondRegistered.cookie);
+  assert(secondOrders.data.orders.every(order => order.user_id === secondUserId), 'order isolation failed');
+
+  await pool.query('UPDATE users SET balance=5000 WHERE id=$1', [userId]);
+  const withdrawal = await post('/api/withdrawals', { wallet: 'Easypaisa', accountNumber: '03000000000', accountHolder: 'E2E Test', amount: 2500 }, userCookie);
+  assert(withdrawal.response.ok, 'withdrawal creation failed');
+  withdrawalId = (await pool.query('SELECT id FROM withdrawals WHERE user_id=$1 ORDER BY id DESC LIMIT 1', [userId])).rows[0].id;
+
+  const adminLogin = await post('/api/login', { phone: process.env.ADMIN_PHONE, password: process.env.ADMIN_PASSWORD });
+  assert(adminLogin.response.ok && adminLogin.data.user.role === 'admin', 'admin login failed');
+  const adminCookie = adminLogin.cookie;
+  const adminOrders = await request('/api/admin/orders', {}, adminCookie);
+  assert(adminOrders.data.orders.some(order => order.id === orderId), 'admin order list failed');
+  await patch(`/api/admin/orders/${orderId}`, { status: 'Approved', adminNote: 'Verified in automated test' }, adminCookie);
+  const approvedOrders = await request('/api/orders', {}, userCookie);
+  const approvedOrder = approvedOrders.data.orders.find(order => order.id === orderId);
+  assert(approvedOrder && approvedOrder.status === 'Approved', 'order status did not update for user');
+  const adminWithdrawals = await request('/api/admin/withdrawals', {}, adminCookie);
+  assert(adminWithdrawals.data.withdrawals.some(item => item.id === withdrawalId), 'admin withdrawal list failed');
+  await patch(`/api/admin/withdrawals/${withdrawalId}`, { status: 'Processing' }, adminCookie);
+  const userWithdrawals = await request('/api/withdrawals', {}, userCookie);
+  const processedWithdrawal = userWithdrawals.data.withdrawals.find(item => item.id === withdrawalId);
+  assert(processedWithdrawal && processedWithdrawal.status === 'Processing', 'withdrawal status did not update');
+  const methods = await request('/api/admin/payment-methods', {}, adminCookie);
+  assert(methods.data.methods.length > 0, 'admin payment methods failed');
+  const normalAdminAttempt = await request('/api/admin/orders', {}, userCookie);
+  assert(normalAdminAttempt.response.status === 403, 'normal user reached admin API');
+
+  const tempPlan = await post('/api/admin/plans', { name: `E2E ${Date.now()}`, investment: 1234, dailyReturn: 50, durationDays: 30, totalReturn: 1500, description: 'Temporary test plan' }, adminCookie);
+  assert(tempPlan.response.status === 201, 'admin plan creation failed');
+  tempPlanId = tempPlan.data.plan.id;
+  await patch(`/api/admin/plans/${tempPlanId}`, { active: false }, adminCookie);
+  const tempMethod = await post('/api/admin/payment-methods', { name: `E2E Method ${Date.now()}`, details: 'Temporary test method' }, adminCookie);
+  assert(tempMethod.response.status === 201, 'admin payment method creation failed');
+  tempMethodId = tempMethod.data.method.id;
+  console.log('NEON_E2E_PASS');
+} catch (error) {
+  console.error(`NEON_E2E_FAIL: ${error.message}`);
+  process.exitCode = 1;
+} finally {
+  if (tempMethodId) await pool.query('DELETE FROM payment_methods WHERE id=$1', [tempMethodId]);
+  if (tempPlanId) await pool.query('DELETE FROM plans WHERE id=$1', [tempPlanId]);
+  if (secondUserId) await pool.query('DELETE FROM users WHERE id=$1', [secondUserId]);
+  if (userId) await pool.query('DELETE FROM users WHERE id=$1', [userId]);
+  await pool.end();
+}
