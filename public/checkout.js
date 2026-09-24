@@ -6,21 +6,17 @@ const checkoutToast = message => {
 };
 
 const imageDataUrl = file => new Promise((resolve, reject) => {
+  if (!file || !/^image\/(jpeg|png|webp)$/i.test(file.type)) {
+    reject(new Error('Please upload a JPG, PNG, or WEBP image.'));
+    return;
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    reject(new Error('Payment proof must be 5 MB or smaller.'));
+    return;
+  }
   const reader = new FileReader();
-  reader.onload = () => {
-    const image = new Image();
-    image.onload = () => {
-      const scale = Math.min(1, 1600 / image.width);
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.round(image.width * scale));
-      canvas.height = Math.max(1, Math.round(image.height * scale));
-      canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
-      resolve(canvas.toDataURL('image/jpeg', 0.78));
-    };
-    image.onerror = () => reject(new Error('The payment screenshot could not be read.'));
-    image.src = reader.result;
-  };
-  reader.onerror = () => reject(new Error('The payment screenshot could not be read.'));
+  reader.onload = () => resolve(String(reader.result));
+  reader.onerror = () => reject(new Error('Payment proof upload failed. Please try again.'));
   reader.readAsDataURL(file);
 });
 
@@ -48,6 +44,6 @@ document.addEventListener('submit', async event => {
     window.history.pushState({}, '', '/orders');
     window.location.reload();
   } catch (error) {
-    checkoutToast(error.message);
+    checkoutToast(error.message === 'The payment screenshot could not be read.' ? 'Payment proof upload failed. Please try again.' : error.message);
   }
 }, true);

@@ -19,16 +19,28 @@ const assert = (condition, message) => { if (!condition) throw new Error(message
 let userId;
 let secondUserId;
 let orderId;
+let qualifiedOrderId;
 let withdrawalId;
 let tempPlanId;
 let tempMethodId;
 try {
   const phone = randomPhone();
   const password = randomPassword();
-  const registered = await post('/api/register', { phone, password });
+  const testDeviceIp = `198.51.100.${crypto.randomInt(1, 250)}`;
+  const registered = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': testDeviceIp }, body: JSON.stringify({ phone, password }) });
   assert(registered.response.status === 201, `registration failed (${registered.response.status}): ${registered.data.error || 'no error returned'}`);
   userId = registered.data.user.id;
   let userCookie = registered.cookie;
+  const referralCode = registered.data.user.referralCode;
+  const referredPhone = randomPhone();
+  const referred = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': `198.51.101.${crypto.randomInt(1, 250)}` }, body: JSON.stringify({ phone: referredPhone, password: randomPassword(), referralCode }) });
+  assert(referred.response.status === 201, 'referred registration failed');
+  secondUserId = referred.data.user.id;
+  const referralRows = (await pool.query('SELECT id,referred_by FROM users WHERE id=$1', [secondUserId])).rows[0];
+  const referrerRows = (await pool.query('SELECT total_referrals,referral_earnings FROM users WHERE id=$1', [userId])).rows[0];
+  const referrerSession = (await request('/api/session', {}, userCookie)).data.user;
+  assert(referralRows.referred_by === userId, `referral relationship was not persisted (${userId},${secondUserId},${referralRows.referred_by})`);
+  assert(referrerRows.total_referrals === 1 && referrerRows.referral_earnings === 0, 'referral signup must not issue a reward');
   const session = await request('/api/session', {}, userCookie);
   assert(session.data.user.id === userId, 'session failed');
   const loggedOut = await post('/api/logout', {}, userCookie);
@@ -38,18 +50,19 @@ try {
   userCookie = loggedIn.cookie;
 
   const tasks = await request('/api/tasks', {}, userCookie);
-  assert(tasks.data.brands.length === 10, 'tasks did not load');
+  assert(tasks.data.tasks.length === Number(tasks.data.taskCount) && tasks.data.enabled, 'tasks did not load');
   const completed = await post('/api/tasks/complete', {}, userCookie);
   assert(completed.response.ok, 'task completion failed');
   const balanceAfterTask = (await pool.query('SELECT balance FROM users WHERE id=$1', [userId])).rows[0].balance;
-  assert(balanceAfterTask === 350, 'task reward was not persisted');
+  const expectedTaskBalance = Number(tasks.data.totalReward);
+  assert(balanceAfterTask === expectedTaskBalance, `task reward was not persisted (${balanceAfterTask} !== ${expectedTaskBalance})`);
 
   const plans = await request('/api/plans', {}, userCookie);
   assert(plans.data.plans.length > 0, 'plans did not load from PostgreSQL');
   const plan = plans.data.plans[0];
   const details = await request(`/api/plans/${plan.id}`, {}, userCookie);
   assert(details.data.paymentMethods.length > 0, 'payment methods did not load');
-  const createdOrder = await post('/api/orders', { planId: plan.id, paymentMethodId: details.data.paymentMethods[0].id, paymentReference: 'E2E-REFERENCE', paymentDetails: 'E2E wallet details', paymentProof: 'https://example.com/e2e-proof' }, userCookie);
+  const createdOrder = await post('/api/orders', { planId: plan.id, paymentMethodId: details.data.paymentMethods[0].id, paymentReference: 'E2E-REFERENCE', paymentDetails: 'E2E wallet details', paymentProof: 'data:image/jpeg;base64,/9j/AA==' }, userCookie);
   assert(createdOrder.response.status === 201, 'order creation failed');
   orderId = createdOrder.data.orderId;
   const dbOrder = (await pool.query('SELECT user_id,status FROM orders WHERE id=$1', [orderId])).rows[0];
@@ -57,26 +70,33 @@ try {
   const userOrders = await request('/api/orders', {}, userCookie);
   assert(userOrders.data.orders.some(order => order.id === orderId), 'user order list failed');
 
-  const secondPhone = randomPhone();
-  const secondRegistered = await post('/api/register', { phone: secondPhone, password: randomPassword() });
-  secondUserId = secondRegistered.data.user.id;
-  const secondOrders = await request('/api/orders', {}, secondRegistered.cookie);
+  const secondOrders = await request('/api/orders', {}, referred.cookie);
   assert(secondOrders.data.orders.every(order => order.user_id === secondUserId), 'order isolation failed');
 
-  await pool.query('UPDATE users SET balance=5000 WHERE id=$1', [userId]);
-  const withdrawal = await post('/api/withdrawals', { wallet: 'Easypaisa', accountNumber: '03000000000', accountHolder: 'E2E Test', amount: 2500 }, userCookie);
-  assert(withdrawal.response.ok, 'withdrawal creation failed');
-  withdrawalId = (await pool.query('SELECT id FROM withdrawals WHERE user_id=$1 ORDER BY id DESC LIMIT 1', [userId])).rows[0].id;
-
-  const adminLogin = await post('/api/login', { phone: process.env.ADMIN_PHONE, password: process.env.ADMIN_PASSWORD });
-  assert(adminLogin.response.ok && adminLogin.data.user.role === 'admin', 'admin login failed');
+  const adminLogin = await post('/api/admin/login', { email: process.env.ADMIN_EMAIL || process.env.ADMIN_PHONE, password: process.env.ADMIN_PASSWORD });
+  assert(adminLogin.response.ok, 'admin login failed');
   const adminCookie = adminLogin.cookie;
+  const adminSession = await request('/api/admin/session', {}, adminCookie);
+  assert(adminSession.response.ok, 'admin session failed');
+  const referredOrder = await post('/api/orders', { planId: plan.id, paymentMethodId: details.data.paymentMethods[0].id, paymentReference: 'E2E-REFERRAL-ORDER', paymentDetails: 'E2E referral wallet', paymentProof: 'data:image/png;base64,iVBORw0KGgo=' }, referred.cookie);
+  assert(referredOrder.response.status === 201, 'referred order creation failed');
+  qualifiedOrderId = referredOrder.data.orderId;
+  await patch(`/api/admin/orders/${qualifiedOrderId}`, { status: 'Approved' }, adminCookie);
+  const qualifiedReferral = (await pool.query('SELECT status,reward_amount FROM referral_rewards WHERE referred_user_id=$1', [secondUserId])).rows[0];
+  assert(['rewarded','credited'].includes(qualifiedReferral.status) && Number(qualifiedReferral.reward_amount) === 80, 'referral was not rewarded after approval');
+  await patch(`/api/admin/orders/${qualifiedOrderId}`, { status: 'Approved' }, adminCookie);
+  const rewardCount = (await pool.query("SELECT COUNT(*)::int AS count FROM ledger_transactions WHERE source='referral_reward' AND reference=$1", [`referral:${(await pool.query('SELECT id FROM referral_rewards WHERE referred_user_id=$1', [secondUserId])).rows[0].id}`])).rows[0].count;
+  assert(rewardCount === 1, 'referral approval was not idempotent');
   const adminOrders = await request('/api/admin/orders', {}, adminCookie);
   assert(adminOrders.data.orders.some(order => order.id === orderId), 'admin order list failed');
   await patch(`/api/admin/orders/${orderId}`, { status: 'Approved', adminNote: 'Verified in automated test' }, adminCookie);
   const approvedOrders = await request('/api/orders', {}, userCookie);
   const approvedOrder = approvedOrders.data.orders.find(order => order.id === orderId);
   assert(approvedOrder && approvedOrder.status === 'Approved', 'order status did not update for user');
+  await pool.query('UPDATE users SET balance=5000 WHERE id=$1', [userId]);
+  const withdrawal = await post('/api/withdrawals', { wallet: 'Easypaisa', accountNumber: '03000000000', accountHolder: 'E2E Test', amount: 2500 }, userCookie);
+  assert(withdrawal.response.ok, 'withdrawal creation failed');
+  withdrawalId = (await pool.query('SELECT id FROM withdrawals WHERE user_id=$1 ORDER BY id DESC LIMIT 1', [userId])).rows[0].id;
   const adminWithdrawals = await request('/api/admin/withdrawals', {}, adminCookie);
   assert(adminWithdrawals.data.withdrawals.some(item => item.id === withdrawalId), 'admin withdrawal list failed');
   await patch(`/api/admin/withdrawals/${withdrawalId}`, { status: 'Processing' }, adminCookie);
@@ -86,7 +106,7 @@ try {
   const methods = await request('/api/admin/payment-methods', {}, adminCookie);
   assert(methods.data.methods.length > 0, 'admin payment methods failed');
   const normalAdminAttempt = await request('/api/admin/orders', {}, userCookie);
-  assert(normalAdminAttempt.response.status === 403, 'normal user reached admin API');
+  assert([401, 403].includes(normalAdminAttempt.response.status), 'normal user reached admin API');
 
   const tempPlan = await post('/api/admin/plans', { name: `E2E ${Date.now()}`, investment: 1234, dailyReturn: 50, durationDays: 30, totalReturn: 1500, description: 'Temporary test plan' }, adminCookie);
   assert(tempPlan.response.status === 201, 'admin plan creation failed');
@@ -102,6 +122,8 @@ try {
 } finally {
   if (tempMethodId) await pool.query('DELETE FROM payment_methods WHERE id=$1', [tempMethodId]);
   if (tempPlanId) await pool.query('DELETE FROM plans WHERE id=$1', [tempPlanId]);
+  if (qualifiedOrderId) { await pool.query('UPDATE referral_rewards SET qualified_order_id = NULL WHERE qualified_order_id = $1', [qualifiedOrderId]); await pool.query('DELETE FROM orders WHERE id=$1', [qualifiedOrderId]); }
+    if (userId || secondUserId) await pool.query('DELETE FROM admin_audit_log WHERE target_user_id = ANY($1::int[]) OR actor_user_id = ANY($1::int[])', [[userId, secondUserId].filter(Boolean)]);
   if (secondUserId) await pool.query('DELETE FROM users WHERE id=$1', [secondUserId]);
   if (userId) await pool.query('DELETE FROM users WHERE id=$1', [userId]);
   await pool.end();
