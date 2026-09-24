@@ -161,6 +161,14 @@ app.get('/api/admin/payment-methods', adminAuth, async (req, res) => res.json({ 
 app.post('/api/admin/payment-methods', adminAuth, async (req, res) => { const result = await query('INSERT INTO payment_methods(name,details,enabled) VALUES($1,$2,COALESCE($3,true)) RETURNING *', [req.body.name, req.body.details || '', req.body.enabled]); res.status(201).json({ method: result.rows[0] }); });
 app.patch('/api/admin/payment-methods/:id', adminAuth, async (req, res) => { const result = await query('UPDATE payment_methods SET name=COALESCE($1,name),details=COALESCE($2,details),enabled=COALESCE($3,enabled) WHERE id=$4 RETURNING *', [req.body.name, req.body.details, req.body.enabled, req.params.id]); res.json({ method: result.rows[0] }); });
 app.delete('/api/admin/payment-methods/:id', adminAuth, async (req, res) => { await query('DELETE FROM payment_methods WHERE id=$1', [req.params.id]); res.json({ ok: true }); });
+app.get('/api/admin/users', adminAuth, async (req, res) => res.json({ users: (await query('SELECT id,phone,role,balance,total_reviews,total_referrals,referral_earnings,referred_by,created_at FROM users ORDER BY created_at DESC')).rows }));
+app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
+  const balance = Number(req.body.balance);
+  if (!Number.isInteger(balance) || balance < 0) return res.status(400).json({ error: 'Balance must be a non-negative whole number.' });
+  const result = await query('UPDATE users SET balance=$1 WHERE id=$2 RETURNING id,phone,role,balance,total_reviews,total_referrals,referral_earnings,referred_by,created_at', [balance, req.params.id]);
+  if (!result.rows[0]) return res.status(404).json({ error: 'User not found.' });
+  res.json({ user: result.rows[0] });
+});
 
 const ensureAdmin = async () => {
   if (!pool || !process.env.ADMIN_PHONE || !process.env.ADMIN_PASSWORD) return;
