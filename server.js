@@ -978,7 +978,7 @@ app.patch('/api/notifications/:id/popup-seen', auth, async (req, res) => {
 });
 
 app.get('/api/withdrawals', auth, async (req, res) => {
-  const withdrawals = await query('SELECT id, wallet, account_number, account_holder, amount, status, created_at FROM withdrawals WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
+  const withdrawals = await query('SELECT id, wallet, account_number, account_holder, amount, status, approved_at, created_at FROM withdrawals WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
   res.json({ withdrawals: withdrawals.rows });
 });
 

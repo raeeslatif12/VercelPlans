@@ -1,0 +1,12 @@
+import 'dotenv/config';
+import pg from 'pg';
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const phone = `03${Math.floor(100000000 + Math.random() * 899999999)}`;
+const code = `D${Math.floor(Math.random() * 100000000)}`;
+const created = await pool.query('INSERT INTO users(phone,password_hash,referral_code) VALUES($1,$2,$3) RETURNING id', [phone, 'x', code]);
+const id = created.rows[0].id;
+await pool.query('UPDATE users SET total_referrals=COALESCE(total_referrals,0)+1,referral_earnings=COALESCE(referral_earnings,0)+80,balance=COALESCE(balance,0)+80 WHERE id=$1', [id]);
+const value = (await pool.query('SELECT total_referrals,referral_earnings,balance FROM users WHERE id=$1', [id])).rows[0];
+console.log(JSON.stringify(value));
+await pool.query('DELETE FROM users WHERE id=$1', [id]);
+await pool.end();
