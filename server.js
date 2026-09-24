@@ -201,6 +201,24 @@ const createLedgerEntry = async (client, userId, amount, type, source, reference
   );
 };
 
+const rewardReferralForApprovedOrder = async (client, orderId, referredUserId) => {
+  const setting = await client.query('SELECT setting_value FROM app_settings WHERE setting_name = \'referral_system_enabled\'');
+  if (setting.rows[0] && setting.rows[0].setting_value === false) return false;
+  const referral = await client.query('SELECT * FROM referral_rewards WHERE referred_user_id = $1 FOR UPDATE', [referredUserId]);
+  if (!referral.rowCount || ['rewarded', 'credited'].includes(referral.rows[0].status)) return false;
+
+  const reward = referral.rows[0];
+  const updated = await client.query(
+    'UPDATE referral_rewards SET status = \'rewarded\', qualified_order_id = $1, qualified_at = NOW(), rewarded_at = NOW() WHERE id = $2 AND status NOT IN (\'rewarded\', \'credited\') RETURNING id',
+    [orderId, reward.id]
+  );
+  if (!updated.rowCount) return false;
+
+  await client.query('UPDATE users SET referral_earnings = referral_earnings + $1, balance = balance + $1, updated_at = NOW() WHERE id = $2', [reward.reward_amount, reward.referrer_user_id]);
+  await createLedgerEntry(client, reward.referrer_user_id, reward.reward_amount, 'credit', 'referral_reward', `referral:${reward.id}`, { referred_user_id: referredUserId, qualified_order_id: orderId, reward_amount: reward.reward_amount });
+  return true;
+};
+
 const insertAuditLog = async (actorUserId, targetUserId, action, metadata = {}) => {
   await query(
     'INSERT INTO admin_audit_log(actor_user_id, target_user_id, action, metadata) VALUES($1,$2,$3,$4::jsonb)',
@@ -232,6 +250,7 @@ const ensureDatabaseSchema = async () => {
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(120) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(160) NOT NULL DEFAULT '';`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'active';`,
+    `ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(12);`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMPTZ;`,
     `ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`,
     `ALTER TABLE orders ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT FALSE;`,
@@ -244,6 +263,9 @@ const ensureDatabaseSchema = async () => {
     `CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_hash VARCHAR(128) NOT NULL UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
     `CREATE TABLE IF NOT EXISTS device_exceptions (id SERIAL PRIMARY KEY, device_hash VARCHAR(128) NOT NULL UNIQUE, allowed BOOLEAN NOT NULL DEFAULT FALSE, reason TEXT NOT NULL DEFAULT '', created_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
     `CREATE TABLE IF NOT EXISTS referral_rewards (id SERIAL PRIMARY KEY, referrer_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, referred_user_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE, reward_amount INTEGER NOT NULL DEFAULT 0, status VARCHAR(20) NOT NULL DEFAULT 'credited', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
+    `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS qualified_order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL;`,
+    `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS qualified_at TIMESTAMPTZ;`,
+    `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS rewarded_at TIMESTAMPTZ;`,
     `CREATE TABLE IF NOT EXISTS ledger_transactions (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, amount INTEGER NOT NULL, type VARCHAR(20) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'posted', reference VARCHAR(200) NOT NULL DEFAULT '', source VARCHAR(120) NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
     `CREATE TABLE IF NOT EXISTS plan_daily_profits (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, profit_date DATE NOT NULL, profit_amount INTEGER NOT NULL DEFAULT 0, status VARCHAR(20) NOT NULL DEFAULT 'posted', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, order_id, profit_date));`,
     `CREATE TABLE IF NOT EXISTS daily_task_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_date DATE NOT NULL, task_key VARCHAR(120) NOT NULL, task_name VARCHAR(120) NOT NULL, category VARCHAR(80) NOT NULL DEFAULT '', reward_amount INTEGER NOT NULL DEFAULT 0, completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, task_date, task_key));`,
@@ -264,6 +286,22 @@ const ensureDatabaseSchema = async () => {
       }
     }
   }
+
+  const usersWithoutCodes = await query("SELECT id FROM users WHERE referral_code IS NULL OR referral_code = '' ORDER BY id");
+  for (const user of usersWithoutCodes.rows) {
+    let assigned = false;
+    while (!assigned) {
+      try {
+        await query('UPDATE users SET referral_code = $1, updated_at = NOW() WHERE id = $2 AND (referral_code IS NULL OR referral_code = \'\')', [generateReferralCode(), user.id]);
+        assigned = true;
+      } catch (error) {
+        if (error.code !== '23505' || !String(error.detail || '').includes('referral_code')) throw error;
+      }
+    }
+  }
+  await query('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code_unique ON users(referral_code)');
+  await query('ALTER TABLE users ALTER COLUMN referral_code SET NOT NULL');
+  await query('ALTER TABLE referral_rewards ALTER COLUMN status SET DEFAULT \'registered\'');
 
   for (const [name, value] of Object.entries(defaultSettings)) {
     await writeSetting(name, value);
@@ -376,11 +414,6 @@ app.post('/api/register', async (req, res) => {
       }
     }
     if (client) await client.query('BEGIN');
-    const existing = await db.query('SELECT id FROM users WHERE phone = $1', [phone]);
-    if (existing.rows[0]) {
-      if (client) await client.query('ROLLBACK');
-      return res.status(409).json({ error: 'This mobile number is already registered.' });
-    }
     const normalizedReferralCode = String(referralCode || '').trim().toUpperCase();
     let referrer = null;
     if (normalizedReferralCode) {
@@ -395,30 +428,36 @@ app.post('/api/register', async (req, res) => {
       }
     }
 
-    let code;
-    do {
-      code = generateReferralCode();
-    } while ((await db.query('SELECT 1 FROM users WHERE referral_code = $1', [code])).rowCount);
+    const existing = await db.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    if (existing.rows[0]) {
+      if (client) await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'This mobile number is already registered.' });
+    }
 
-    const created = await db.query(
-      'INSERT INTO users(phone,password_hash,referral_code,referred_by) VALUES($1,$2,$3,$4) RETURNING *',
-      [phone, await bcrypt.hash(password, 12), code, referrer?.id || null]
-    );
+    let created;
+    for (;;) {
+      try {
+        created = await db.query(
+          'INSERT INTO users(phone,password_hash,referral_code,referred_by) VALUES($1,$2,$3,$4) RETURNING *',
+          [phone, await bcrypt.hash(password, 12), generateReferralCode(), referrer?.id || null]
+        );
+        break;
+      } catch (error) {
+        if (error.code !== '23505' || !String(error.detail || '').includes('referral_code')) throw error;
+      }
+    }
 
     if (deviceHash) {
       await db.query('INSERT INTO user_devices(user_id, device_hash) VALUES($1,$2) ON CONFLICT(device_hash) DO NOTHING', [created.rows[0].id, deviceHash]);
     }
 
-    if (referrer && settings.referral_system_enabled) {
+    if (referrer) {
       const rewardAmount = Number(settings.referral_reward_amount || 80);
-      const existingReward = await db.query(
-        'INSERT INTO referral_rewards(referrer_user_id, referred_user_id, reward_amount, status) VALUES($1,$2,$3,\'credited\') ON CONFLICT(referred_user_id) DO NOTHING RETURNING id',
+      await db.query(
+        'INSERT INTO referral_rewards(referrer_user_id, referred_user_id, reward_amount, status) VALUES($1,$2,$3,\'registered\') ON CONFLICT(referred_user_id) DO NOTHING',
         [referrer.id, created.rows[0].id, rewardAmount]
       );
-      if (existingReward.rowCount) {
-        await db.query('UPDATE users SET total_referrals = total_referrals + 1, referral_earnings = referral_earnings + $1, balance = balance + $1 WHERE id = $2', [rewardAmount, referrer.id]);
-        await createLedgerEntry(db, referrer.id, rewardAmount, 'credit', 'referral_reward', `referral:${created.rows[0].id}`, { referred_user_id: created.rows[0].id, reward_amount: rewardAmount });
-      }
+      await db.query('UPDATE users SET total_referrals = total_referrals + 1, updated_at = NOW() WHERE id = $1', [referrer.id]);
     }
 
     if (client) await client.query('COMMIT');
@@ -734,6 +773,7 @@ app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
     if (nextStatus !== 'Approved' && currentOrder.rows[0].active) {
       await client.query('UPDATE orders SET active = false WHERE id = $1', [req.params.id]);
     }
+    if (nextStatus === 'Approved') await rewardReferralForApprovedOrder(client, req.params.id, currentOrder.rows[0].user_id);
     await client.query('COMMIT');
     await insertAuditLog(req.admin.id, currentOrder.rows[0].user_id, 'order_status_updated', { order_id: req.params.id, status: nextStatus, admin_note: adminNote || '' });
     res.json({ order: updated.rows[0] });
