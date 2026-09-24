@@ -20,6 +20,7 @@ const brands = [
 ];
 const defaultSettings = {
   referral_reward_amount: 80,
+  account_creation_reward_amount: 0,
   referral_system_enabled: true,
   minimum_withdrawal_amount: 500,
   withdrawal_system_enabled: true,
@@ -491,6 +492,11 @@ app.post('/api/register', async (req, res) => {
         [referrer.id, created.rows[0].id, rewardAmount]
       );
       await db.query('UPDATE users SET total_referrals = total_referrals + 1, updated_at = NOW() WHERE id = $1', [referrer.id]);
+      const accountCreationReward = Number(settings.account_creation_reward_amount || 0);
+      if (accountCreationReward > 0) {
+        await db.query('UPDATE users SET balance = balance + $1, referral_earnings = referral_earnings + $1, updated_at = NOW() WHERE id = $2', [accountCreationReward, referrer.id]);
+        await createLedgerEntry(db, referrer.id, accountCreationReward, 'credit', 'account_creation_reward', `account_creation:${created.rows[0].id}`, { referred_user_id: created.rows[0].id, amount: accountCreationReward });
+      }
     }
 
     if (client) await client.query('COMMIT');
@@ -817,6 +823,19 @@ app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
       await client.query('UPDATE orders SET active = false WHERE id = $1', [req.params.id]);
     }
     if (nextStatus === 'Approved') await rewardReferralForApprovedOrder(client, req.params.id, currentOrder.rows[0].user_id);
+    if (nextStatus === 'Approved' && !currentOrder.rows[0].active && await readSetting('daily_profit_enabled', true)) {
+      const plan = await client.query('SELECT daily_return FROM plans WHERE id = $1', [currentOrder.rows[0].plan_id]);
+      const profitDate = new Date().toISOString().slice(0, 10);
+      const firstDayProfit = await client.query(
+        'INSERT INTO plan_daily_profits(user_id, order_id, plan_id, profit_date, profit_amount, status) VALUES($1,$2,$3,$4,$5,\'posted\') ON CONFLICT(user_id, order_id, profit_date) DO NOTHING RETURNING id',
+        [currentOrder.rows[0].user_id, currentOrder.rows[0].id, currentOrder.rows[0].plan_id, profitDate, Number(plan.rows[0]?.daily_return || 0)]
+      );
+      if (firstDayProfit.rowCount) {
+        const amount = Number(plan.rows[0]?.daily_return || 0);
+        await client.query('UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE id = $2', [amount, currentOrder.rows[0].user_id]);
+        await createLedgerEntry(client, currentOrder.rows[0].user_id, amount, 'credit', 'daily_plan_profit', `plan_profit:${currentOrder.rows[0].id}:${profitDate}`, { order_id: currentOrder.rows[0].id, plan_id: currentOrder.rows[0].plan_id, profit_date: profitDate, amount });
+      }
+    }
     await client.query('COMMIT');
     await insertAuditLog(req.admin.id, currentOrder.rows[0].user_id, 'order_status_updated', { order_id: req.params.id, status: nextStatus, admin_note: adminNote || '' });
     res.json({ order: updated.rows[0] });
