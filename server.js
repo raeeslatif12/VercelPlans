@@ -57,13 +57,15 @@ const normalizeOrigin = value => {
   }
 };
 const requestOrigin = req => {
-  const protocol = String(req.get('x-forwarded-proto') || req.protocol || '').split(',')[0].trim();
+  const forwardedProtocol = String(req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const protocol = forwardedProtocol || (process.env.VERCEL === '1' || process.env.VERCEL_URL ? 'https' : req.protocol);
   const host = String(req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
   return normalizeOrigin(`${protocol}://${host}`);
 };
+const vercelOrigin = String(process.env.VERCEL_URL || '').startsWith('http') ? process.env.VERCEL_URL : `https://${process.env.VERCEL_URL || ''}`;
 const allowedOrigins = new Set([
   normalizeOrigin(process.env.APP_ORIGIN),
-  normalizeOrigin(process.env.VERCEL_URL && `https://${process.env.VERCEL_URL}`),
+  normalizeOrigin(vercelOrigin),
 ].filter(Boolean));
 const originGuard = (req, res, next) => {
   if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
