@@ -2,7 +2,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import pg from 'pg';
 
-const base = `http://localhost:${process.env.PORT || 3000}`;
+const base = process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const randomPhone = () => `03${crypto.randomInt(100000000, 999999999)}`;
 const randomPassword = () => `${crypto.randomBytes(18).toString('base64url')}Aa1!`;
