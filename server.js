@@ -963,7 +963,7 @@ app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
     query(`SELECT rr.*, u.id AS referrer_user_id, u.name AS referrer_name, u.phone AS referrer_phone, u.email AS referrer_email
       FROM referral_rewards rr JOIN users u ON u.id = rr.referrer_user_id WHERE rr.referred_user_id = $1 LIMIT 1`, [userId]),
     query('SELECT * FROM ledger_transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100', [userId]),
-    query('SELECT ud.*, COALESCE(de.allowed, false) AS exception_allowed, COALESCE(de.reason, \'\') AS exception_reason FROM user_devices ud LEFT JOIN device_exceptions de ON de.device_hash = ud.device_hash WHERE ud.user_id = $1 ORDER BY ud.created_at DESC', [userId]),
+    query('SELECT ud.*, COALESCE(de.allowed, false) AS exception_allowed, COALESCE(de.additional_accounts, 0)::int AS additional_accounts, COALESCE(de.reason, \'\') AS exception_reason FROM user_devices ud LEFT JOIN device_exceptions de ON de.device_hash = ud.device_hash WHERE ud.user_id = $1 ORDER BY ud.created_at DESC', [userId]),
     query('SELECT id, actor_user_id, target_user_id, action, metadata, created_at FROM admin_audit_log WHERE target_user_id = $1 ORDER BY created_at DESC LIMIT 100', [userId]),
   ]);
 
@@ -993,10 +993,11 @@ app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
     ...ledger.rows.map(row => ({ type: row.source || 'Ledger entry', date: row.created_at, detail: `${row.type} · ${row.amount}`, metadata: row.metadata })),
   ].sort((a, b) => new Date(b.date) - new Date(a.date));
   const detailUser = { ...safeUser(user.rows[0]), created_at: user.rows[0].created_at, updated_at: user.rows[0].updated_at, last_login_at: user.rows[0].last_login_at, referred_by: user.rows[0].referred_by };
+  const settings = await readAllSettings();
   res.json({
     user: detailUser,
     summary: { balance: Number(user.rows[0].balance || 0), total_earned: totalEarned, active_plan: planRows.find(row => row.display_status === 'Active')?.plan_name || 'No active plan', daily_profit: planRows.filter(row => row.display_status === 'Active').reduce((sum, row) => sum + Number(row.daily_profit || 0), 0), total_referrals: referralSummary.total, approved_referrals: referralSummary.approved, pending_referrals: referralSummary.pending, referral_earnings: referralSummary.earnings, total_orders: orders.rowCount, total_withdrawals: totalWithdrawals, account_status: user.rows[0].status },
-    plans: planRows, orders: orders.rows, withdrawals: withdrawals.rows, tasks: tasks.rows, referrals: referrals.rows, referredBy: referredBy.rows[0] || null, referralSummary, ledger: ledger.rows, devices: devices.rows, activity,
+    plans: planRows, orders: orders.rows, withdrawals: withdrawals.rows, tasks: tasks.rows, referrals: referrals.rows, referredBy: referredBy.rows[0] || null, referralSummary, ledger: ledger.rows, devices: devices.rows, deviceLimit: Math.max(1, Number(settings.max_accounts_per_device || 1)), activity,
   });
 });
 
@@ -1128,7 +1129,7 @@ app.put('/api/admin/settings', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/device-exceptions', adminAuth, async (req, res) => {
-  const { deviceHash, allowed, additionalAccounts = 1, reason = '' } = req.body || {};
+  const { deviceHash, allowed, additionalAccounts = 1, reason = '', userId = null } = req.body || {};
   if (!deviceHash) return res.status(400).json({ error: 'A device hash is required.' });
   const extra = Number(additionalAccounts);
   if (!Number.isInteger(extra) || extra < 0 || extra > 50) return res.status(400).json({ error: 'Additional accounts must be a whole number from 0 to 50.' });
@@ -1136,7 +1137,8 @@ app.post('/api/admin/device-exceptions', adminAuth, async (req, res) => {
     'INSERT INTO device_exceptions(device_hash, allowed, additional_accounts, reason, created_by, updated_at) VALUES($1,$2,$3,$4,$5,NOW()) ON CONFLICT(device_hash) DO UPDATE SET allowed = EXCLUDED.allowed, additional_accounts = EXCLUDED.additional_accounts, reason = EXCLUDED.reason, created_by = EXCLUDED.created_by, updated_at = NOW()',
     [deviceHash, Boolean(allowed), extra, reason, req.admin.id]
   );
-  await insertAuditLog(req.admin.id, null, 'device_exception_updated', { device_hash: deviceHash, allowed: Boolean(allowed), additional_accounts: extra, reason });
+  const targetUserId = Number.isInteger(Number(userId)) ? Number(userId) : null;
+  await insertAuditLog(req.admin.id, targetUserId, 'device_exception_updated', { device_hash: deviceHash, allowed: Boolean(allowed), additional_accounts: extra, reason, user_id: targetUserId });
   res.json({ ok: true, additionalAccounts: extra });
 });
 
