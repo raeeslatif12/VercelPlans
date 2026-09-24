@@ -468,7 +468,7 @@ app.post('/api/register', async (req, res) => {
     if (client) await client.query('BEGIN');
     if (settings.device_restriction_enabled) {
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [deviceHash]);
-      const accountCount = Number((await db.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count || 0);
+      const accountCount = Number((await db.query("SELECT COUNT(*)::int AS count FROM user_devices ud JOIN users u ON u.id = ud.user_id WHERE ud.device_hash = $1 AND u.status <> 'deleted'", [deviceHash])).rows[0].count || 0);
       const exception = (await db.query('SELECT allowed, additional_accounts FROM device_exceptions WHERE device_hash = $1', [deviceHash])).rows[0];
       const configuredLimit = Math.max(1, Number(settings.max_accounts_per_device || (settings.allow_multiple_accounts_per_device ? 2 : 1)));
       const allowedLimit = configuredLimit + (exception?.allowed ? Math.max(0, Number(exception.additional_accounts || 0)) : 0);
