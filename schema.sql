@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS user_devices (
   id SERIAL PRIMARY KEY,
   user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
   device_hash VARCHAR(128) NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  released_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_device_user ON user_devices(device_hash, user_id);
@@ -175,6 +177,24 @@ CREATE INDEX IF NOT EXISTS idx_withdrawals_user_status ON withdrawals(user_id, s
 CREATE INDEX IF NOT EXISTS idx_ledger_user_created ON ledger_transactions(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_daily_tasks_user_date ON daily_task_assignments(user_id, task_date, completed_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ledger_user_source_reference ON ledger_transactions(user_id, source, reference);
+
+CREATE TABLE IF NOT EXISTS user_notifications (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title VARCHAR(200) NOT NULL DEFAULT 'Congratulations!',
+  message TEXT NOT NULL DEFAULT '',
+  amount INTEGER NOT NULL DEFAULT 0,
+  reason VARCHAR(180) NOT NULL DEFAULT '',
+  source VARCHAR(120) NOT NULL DEFAULT '',
+  reference VARCHAR(200) NOT NULL DEFAULT '',
+  metadata JSONB NOT NULL DEFAULT '{}',
+  status VARCHAR(20) NOT NULL DEFAULT 'unread',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  read_at TIMESTAMPTZ,
+  popup_seen_at TIMESTAMPTZ,
+  UNIQUE(user_id, source, reference)
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON user_notifications(user_id, created_at DESC);
 
 INSERT INTO plans(name, investment, daily_return, duration_days, total_return, description)
 VALUES

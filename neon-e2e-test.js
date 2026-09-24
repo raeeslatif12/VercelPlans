@@ -21,6 +21,8 @@ let userId;
 let secondUserId;
 let deviceSecondId;
 let deviceThirdId;
+let releaseUserId;
+let releaseReplacementId;
 let adminCreatedId;
 let adminCreatedPhone;
 let adminCreatedPassword;
@@ -107,6 +109,22 @@ try {
   e2eDeviceHash = deviceHash;
   const deviceCountAfterSecond = Number((await pool.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count);
   assert(deviceCountAfterSecond === 2, 'device registration history did not record both accounts');
+  await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ max_accounts_per_device: 1 }) }, adminCookie);
+  const releaseDeviceIp = `198.51.104.${crypto.randomInt(1, 250)}`;
+  const releaseRegistration = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': releaseDeviceIp }, body: JSON.stringify(registrationBody(randomPhone(), randomPassword())) });
+  assert(releaseRegistration.response.status === 201, 'isolated release-device registration failed');
+  releaseUserId = releaseRegistration.data.user.id;
+  const releaseDeviceHash = (await pool.query('SELECT device_hash FROM user_devices WHERE user_id = $1 LIMIT 1', [releaseUserId])).rows[0].device_hash;
+  const releaseDelete = await request(`/api/admin/users/${releaseUserId}`, { method: 'DELETE' }, adminCookie);
+  assert(releaseDelete.response.ok, 'isolated release-device soft deletion failed');
+  const releasedDevice = (await pool.query('SELECT active,released_at FROM user_devices WHERE user_id = $1 AND device_hash = $2', [releaseUserId, releaseDeviceHash])).rows[0];
+  assert(releasedDevice.active === false && releasedDevice.released_at, 'deleted user device association was not released');
+  const releaseReplacement = await request('/api/register', { method: 'POST', headers: { 'x-forwarded-for': releaseDeviceIp }, body: JSON.stringify(registrationBody(randomPhone(), randomPassword())) });
+  assert(releaseReplacement.response.status === 201, 'released device could not register a replacement account');
+  releaseReplacementId = releaseReplacement.data.user.id;
+  const releaseActiveCount = Number((await pool.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1 AND active = true', [releaseDeviceHash])).rows[0].count);
+  assert(releaseActiveCount === 1, 'released device active association count is incorrect');
+  await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ max_accounts_per_device: 2 }) }, adminCookie);
   adminCreatedPhone = randomPhone();
   adminCreatedPassword = randomPassword();
   const adminCreated = await post('/api/admin/users', { name: 'E2E Created User', phone: adminCreatedPhone, email: `e2e-${Date.now()}@example.invalid`, password: adminCreatedPassword, status: 'active' }, adminCookie);
@@ -132,6 +150,12 @@ try {
   assert(referralNotifications.response.ok, 'user notifications endpoint failed');
   const referralNotification = referralNotifications.data.notifications.find(item => item.source === 'referral_reward');
   assert(referralNotification && Number(referralNotification.amount) === 80 && referralNotification.status === 'unread', 'referral earnings notification was not created');
+  const popupSeen = await request(`/api/notifications/${referralNotification.id}/popup-seen`, { method: 'PATCH' }, userCookie);
+  assert(popupSeen.response.ok && popupSeen.data.notification.popupSeenAt, 'notification popup-seen state did not persist');
+  const popupSeenAgain = await request(`/api/notifications/${referralNotification.id}/popup-seen`, { method: 'PATCH' }, userCookie);
+  assert(popupSeenAgain.response.ok, 'notification popup-seen state was not idempotent');
+  const persistedPopupState = (await pool.query('SELECT status,popup_seen_at FROM user_notifications WHERE id=$1', [referralNotification.id])).rows[0];
+  assert(persistedPopupState.status === 'unread' && persistedPopupState.popup_seen_at, 'popup-seen state changed notification read history');
   await request(`/api/notifications/${referralNotification.id}/read`, { method: 'PATCH' }, userCookie);
   const updatedReferralNotification = await request('/api/notifications', {}, userCookie);
   assert(updatedReferralNotification.data.notifications.find(item => item.id === referralNotification.id)?.status === 'read', 'notification read state did not persist');
@@ -174,6 +198,7 @@ try {
   const tempMethod = await post('/api/admin/payment-methods', { name: `E2E Method ${Date.now()}`, details: 'Temporary test method' }, adminCookie);
   assert(tempMethod.response.status === 201, 'admin payment method creation failed');
   tempMethodId = tempMethod.data.method.id;
+  await request('/api/admin/settings', { method: 'PUT', body: JSON.stringify({ max_accounts_per_device: 1 }) }, adminCookie);
   const deletedFirst = await request(`/api/admin/users/${userId}`, { method: 'DELETE' }, adminCookie);
   assert(deletedFirst.response.ok, 'first device user soft deletion failed');
   const historyAfterDelete = Number((await pool.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count);
@@ -201,7 +226,7 @@ try {
   if (tempMethodId) await pool.query('DELETE FROM payment_methods WHERE id=$1', [tempMethodId]);
   if (tempPlanId) await pool.query('DELETE FROM plans WHERE id=$1', [tempPlanId]);
   if (qualifiedOrderId) { await pool.query('UPDATE referral_rewards SET qualified_order_id = NULL WHERE qualified_order_id = $1', [qualifiedOrderId]); await pool.query('DELETE FROM orders WHERE id=$1', [qualifiedOrderId]); }
-  const cleanupIds = [userId, secondUserId, deviceSecondId, deviceThirdId, adminCreatedId].filter(Boolean);
+  const cleanupIds = [userId, secondUserId, deviceSecondId, deviceThirdId, releaseUserId, releaseReplacementId, adminCreatedId].filter(Boolean);
   if (cleanupIds.length) {
     await pool.query('DELETE FROM user_devices WHERE user_id = ANY($1::int[])', [cleanupIds]);
     await pool.query('DELETE FROM admin_audit_log WHERE target_user_id = ANY($1::int[]) OR actor_user_id = ANY($1::int[])', [cleanupIds]);

@@ -360,6 +360,7 @@ const makeNotificationPayload = row => ({
   source: row.source,
   reference: row.reference,
   status: row.status,
+  popupSeenAt: row.popup_seen_at || null,
   createdAt: row.created_at,
   metadata: row.metadata || {},
 });
@@ -460,6 +461,9 @@ const ensureDatabaseSchema = async () => {
     `CREATE TABLE IF NOT EXISTS app_settings (id SERIAL PRIMARY KEY, setting_name VARCHAR(120) NOT NULL UNIQUE, setting_value JSONB NOT NULL, updated_by INTEGER REFERENCES users(id), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
     `CREATE TABLE IF NOT EXISTS user_devices (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE SET NULL, device_hash VARCHAR(128) NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
     `ALTER TABLE user_devices ALTER COLUMN user_id DROP NOT NULL;`,
+    `ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;`,
+    `ALTER TABLE user_devices ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ;`,
+    `UPDATE user_devices ud SET active = FALSE, released_at = COALESCE(released_at, NOW()) FROM users u WHERE u.id = ud.user_id AND u.status = 'deleted' AND ud.active = TRUE;`,
     `ALTER TABLE user_devices DROP CONSTRAINT IF EXISTS user_devices_device_hash_key;`,
     `DO $$ DECLARE fk RECORD; BEGIN FOR fk IN SELECT conname FROM pg_constraint WHERE conrelid = 'user_devices'::regclass AND contype = 'f' LOOP EXECUTE format('ALTER TABLE user_devices DROP CONSTRAINT %I', fk.conname); END LOOP; ALTER TABLE user_devices ADD CONSTRAINT user_devices_user_id_fkey FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL; END $$;`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_user_devices_device_user ON user_devices(device_hash, user_id);`,
@@ -472,7 +476,8 @@ const ensureDatabaseSchema = async () => {
     `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS qualified_at TIMESTAMPTZ;`,
     `ALTER TABLE referral_rewards ADD COLUMN IF NOT EXISTS rewarded_at TIMESTAMPTZ;`,
     `CREATE TABLE IF NOT EXISTS ledger_transactions (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, amount INTEGER NOT NULL, type VARCHAR(20) NOT NULL, status VARCHAR(20) NOT NULL DEFAULT 'posted', reference VARCHAR(200) NOT NULL DEFAULT '', source VARCHAR(120) NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());`,
-    `CREATE TABLE IF NOT EXISTS user_notifications (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(200) NOT NULL DEFAULT 'Congratulations!', message TEXT NOT NULL DEFAULT '', amount INTEGER NOT NULL DEFAULT 0, reason VARCHAR(180) NOT NULL DEFAULT '', source VARCHAR(120) NOT NULL DEFAULT '', reference VARCHAR(200) NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}', status VARCHAR(20) NOT NULL DEFAULT 'unread', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), read_at TIMESTAMPTZ, UNIQUE(user_id, source, reference));`,
+    `CREATE TABLE IF NOT EXISTS user_notifications (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, title VARCHAR(200) NOT NULL DEFAULT 'Congratulations!', message TEXT NOT NULL DEFAULT '', amount INTEGER NOT NULL DEFAULT 0, reason VARCHAR(180) NOT NULL DEFAULT '', source VARCHAR(120) NOT NULL DEFAULT '', reference VARCHAR(200) NOT NULL DEFAULT '', metadata JSONB NOT NULL DEFAULT '{}', status VARCHAR(20) NOT NULL DEFAULT 'unread', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), read_at TIMESTAMPTZ, popup_seen_at TIMESTAMPTZ, UNIQUE(user_id, source, reference));`,
+    `ALTER TABLE user_notifications ADD COLUMN IF NOT EXISTS popup_seen_at TIMESTAMPTZ;`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_user_notifications_unique ON user_notifications(user_id, source, reference);`,
     `CREATE TABLE IF NOT EXISTS plan_daily_profits (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, plan_id INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE, profit_date DATE NOT NULL, profit_amount INTEGER NOT NULL DEFAULT 0, status VARCHAR(20) NOT NULL DEFAULT 'posted', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, order_id, profit_date));`,
     `CREATE TABLE IF NOT EXISTS daily_task_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, task_date DATE NOT NULL, task_key VARCHAR(120) NOT NULL, task_name VARCHAR(120) NOT NULL, category VARCHAR(80) NOT NULL DEFAULT '', reward_amount INTEGER NOT NULL DEFAULT 0, completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, task_date, task_key));`,
@@ -676,7 +681,7 @@ app.post('/api/register', async (req, res) => {
     if (client) await client.query('BEGIN');
     if (settings.device_restriction_enabled) {
       await db.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [deviceHash]);
-      const accountCount = Number((await db.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count || 0);
+      const accountCount = Number((await db.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1 AND active = true', [deviceHash])).rows[0].count || 0);
       const exception = (await db.query('SELECT allowed, additional_accounts FROM device_exceptions WHERE device_hash = $1', [deviceHash])).rows[0];
       const allowedLimit = getDeviceLimit(settings, exception);
       if (accountCount >= allowedLimit) {
@@ -718,7 +723,7 @@ app.post('/api/register', async (req, res) => {
     }
 
     if (deviceHash) {
-      await db.query('INSERT INTO user_devices(user_id, device_hash) VALUES($1,$2) ON CONFLICT(device_hash, user_id) DO NOTHING', [created.rows[0].id, deviceHash]);
+      await db.query('INSERT INTO user_devices(user_id, device_hash, active, released_at) VALUES($1,$2,true,NULL) ON CONFLICT(device_hash, user_id) DO UPDATE SET active = true, released_at = NULL', [created.rows[0].id, deviceHash]);
     }
 
     if (referrer) {
@@ -962,6 +967,12 @@ app.get('/api/notifications', auth, async (req, res) => {
 
 app.patch('/api/notifications/:id/read', auth, async (req, res) => {
   const result = await query('UPDATE user_notifications SET status = \'read\', read_at = NOW() WHERE id = $1 AND user_id = $2 RETURNING *', [req.params.id, req.user.id]);
+  if (!result.rowCount) return res.status(404).json({ error: 'Notification not found.' });
+  res.json({ notification: makeNotificationPayload(result.rows[0]) });
+});
+
+app.patch('/api/notifications/:id/popup-seen', auth, async (req, res) => {
+  const result = await query('UPDATE user_notifications SET popup_seen_at = COALESCE(popup_seen_at, NOW()) WHERE id = $1 AND user_id = $2 RETURNING *', [req.params.id, req.user.id]);
   if (!result.rowCount) return res.status(404).json({ error: 'Notification not found.' });
   res.json({ notification: makeNotificationPayload(result.rows[0]) });
 });
@@ -1236,14 +1247,14 @@ app.delete('/api/admin/payment-methods/:id', adminAuth, async (req, res) => {
 });
 
 app.get('/api/admin/users', adminAuth, async (req, res) => {
-  const users = await query(`SELECT u.id, u.phone, u.role, u.balance, u.total_reviews, u.total_referrals, u.referral_earnings, u.referred_by, u.created_at, u.status, u.name, u.first_name, u.last_name, u.email, u.referral_code, COUNT(DISTINCT ud.id)::int AS device_count, COUNT(DISTINCT o.id) FILTER (WHERE o.status = 'Approved' AND o.active = true)::int AS active_plan_count FROM users u LEFT JOIN user_devices ud ON ud.user_id = u.id LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id ORDER BY u.created_at DESC`);
+  const users = await query(`SELECT u.id, u.phone, u.role, u.balance, u.total_reviews, u.total_referrals, u.referral_earnings, u.referred_by, u.created_at, u.status, u.name, u.first_name, u.last_name, u.email, u.referral_code, COUNT(DISTINCT ud.id) FILTER (WHERE ud.active = true)::int AS device_count, COUNT(DISTINCT o.id) FILTER (WHERE o.status = 'Approved' AND o.active = true)::int AS active_plan_count FROM users u LEFT JOIN user_devices ud ON ud.user_id = u.id LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id ORDER BY u.created_at DESC`);
   res.json({ users: users.rows.map(row => ({ ...row, ...safeUser(row) })) });
 });
 
 app.get('/api/admin/devices', adminAuth, async (req, res) => {
   const settings = await readAllSettings();
   const devices = await query(`
-    SELECT ud.device_hash, MIN(ud.created_at) AS first_registered_at, COUNT(ud.id)::int AS account_count,
+    SELECT ud.device_hash, MIN(ud.created_at) AS first_registered_at, COUNT(ud.id) FILTER (WHERE ud.active = true)::int AS account_count,
       COALESCE(json_agg(json_build_object('id', u.id, 'name', u.name, 'phone', u.phone, 'status', u.status, 'created_at', u.created_at) ORDER BY u.created_at) FILTER (WHERE u.id IS NOT NULL), '[]'::json) AS users,
       COALESCE(de.allowed, false) AS exception_allowed, COALESCE(de.additional_accounts, 0)::int AS additional_accounts, COALESCE(de.reason, '') AS exception_reason
     FROM user_devices ud
@@ -1272,7 +1283,7 @@ app.post('/api/admin/users', adminAuth, async (req, res) => {
     if (deviceHash) {
       const settings = await readAllSettings();
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [deviceHash]);
-      const count = Number((await client.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1', [deviceHash])).rows[0].count || 0);
+      const count = Number((await client.query('SELECT COUNT(*)::int AS count FROM user_devices WHERE device_hash = $1 AND active = true', [deviceHash])).rows[0].count || 0);
       const exception = (await client.query('SELECT allowed, additional_accounts FROM device_exceptions WHERE device_hash = $1', [deviceHash])).rows[0];
       const limit = getDeviceLimit(settings, exception);
       if (count >= limit) { await client.query('ROLLBACK'); return res.status(409).json({ error: `That device has reached its account limit (${count}/${limit}).` }); }
@@ -1286,7 +1297,7 @@ app.post('/api/admin/users', adminAuth, async (req, res) => {
         if (error.code !== '23505' || !String(error.detail || '').includes('referral_code')) throw error;
       }
     }
-    if (deviceHash) await client.query('INSERT INTO user_devices(user_id, device_hash) VALUES($1,$2) ON CONFLICT(device_hash, user_id) DO NOTHING', [created.rows[0].id, deviceHash]);
+    if (deviceHash) await client.query('INSERT INTO user_devices(user_id, device_hash, active, released_at) VALUES($1,$2,true,NULL) ON CONFLICT(device_hash, user_id) DO UPDATE SET active = true, released_at = NULL', [created.rows[0].id, deviceHash]);
     await insertAuditLogWithClient(client, req.admin.id, created.rows[0].id, 'user_created', { phone: created.rows[0].phone, name: created.rows[0].name, email: created.rows[0].email, device_assigned: Boolean(deviceHash) });
     await client.query('COMMIT');
     res.status(201).json({ user: safeUser(created.rows[0]) });
@@ -1480,6 +1491,7 @@ app.delete('/api/admin/users/:id', adminAuth, async (req, res) => {
     }
 
     await client.query('UPDATE users SET status = \'deleted\', deleted_at = NOW(), updated_at = NOW() WHERE id = $1', [userId]);
+    await client.query('UPDATE user_devices SET active = false, released_at = NOW() WHERE user_id = $1 AND active = true', [userId]);
     await insertAuditLogWithClient(client, req.admin.id, userId, 'user_deleted', {
       deletion_type: 'soft',
       user_id: userId,
