@@ -5,6 +5,7 @@ import {
   normalizePaymentProofError,
   isSupportedImageType,
   normalizeImageType,
+  readFileAsDataUrl,
 } from './payment-proof-utils.js';
 
 test('normalizes legacy payment screenshot read failures to the friendly upload message', () => {
@@ -23,4 +24,22 @@ test('accepts the common screenshot MIME types used by browsers and normalizes m
   assert.equal(normalizeImageType('image/heic'), 'image/jpeg');
   assert.equal(normalizeImageType('image/heif'), 'image/jpeg');
   assert.equal(isSupportedImageType('image/svg+xml'), false);
+});
+
+test('reads payment screenshots as CSP-safe data URLs instead of blob URLs', async () => {
+  class FakeReader {
+    constructor() {
+      this.onload = null;
+      this.onerror = null;
+      this.result = null;
+    }
+    readAsDataURL(file) {
+      this.result = `data:${file.type};base64,${Buffer.from('demo').toString('base64')}`;
+      if (this.onload) this.onload();
+    }
+  }
+
+  const file = { type: 'image/png', name: 'proof.png' };
+  const value = await readFileAsDataUrl(file, FakeReader);
+  assert.equal(value, 'data:image/png;base64,ZGVtbw==');
 });

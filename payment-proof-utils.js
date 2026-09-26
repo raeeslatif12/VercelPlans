@@ -21,3 +21,18 @@ export const normalizePaymentProofError = errorMessage => {
 };
 
 export const isSupportedImageType = fileType => Boolean(normalizeImageType(fileType));
+
+export const readFileAsDataUrl = (file, FileReaderCtor = globalThis.FileReader) => new Promise((resolve, reject) => {
+  if (!file) return reject(new Error('Please select a payment screenshot.'));
+  const reader = FileReaderCtor ? new FileReaderCtor() : null;
+  if (!reader || typeof reader.readAsDataURL !== 'function') {
+    return reject(new Error('Payment screenshot could not be read.'));
+  }
+  reader.onload = () => {
+    const value = String(reader.result || '');
+    if (!/^data:image\//i.test(value)) return reject(new Error('Payment screenshot could not be read.'));
+    resolve(value);
+  };
+  reader.onerror = () => reject(new Error('Payment screenshot could not be read.'));
+  reader.readAsDataURL(file);
+});

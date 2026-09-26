@@ -253,47 +253,55 @@ const normalizePaymentProofError = message => {
     : normalized;
 };
 const isSupportedImageType = fileType => Boolean(normalizeImageType(fileType) || inferImageTypeFromName(fileType));
-const fileAsDataUrl = file => new Promise((resolve, reject) => {
-  if (!file) return reject(new Error('Please select a payment screenshot.'));
-  const detectedType = normalizeImageType(file.type) || inferImageTypeFromName(file.name);
-  if (!detectedType) return reject(new Error('Please upload a JPG, PNG, WEBP, HEIC, or HEIF image.'));
-  const objectUrl = URL.createObjectURL(file);
-  const image = new Image();
-  image.onload = () => {
-    try {
-      const canvas = document.createElement('canvas');
-      const maxSide = 2048;
-      const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
-      canvas.width = Math.max(1, Math.round(image.width * scale));
-      canvas.height = Math.max(1, Math.round(image.height * scale));
-      const context = canvas.getContext('2d');
-      if (!context) throw new Error('Payment screenshot could not be read.');
-      context.fillStyle = '#ffffff';
-      context.fillRect(0, 0, canvas.width, canvas.height);
-      context.drawImage(image, 0, 0, canvas.width, canvas.height);
-      const outputType = detectedType === 'image/png' ? 'image/png' : 'image/jpeg';
-      let quality = 0.92;
-      let dataUrl = canvas.toDataURL(outputType, quality);
-      const sizeInBytes = () => {
-        try { return atob((dataUrl.split(',')[1] || '')).length; } catch { return dataUrl.length; }
+const fileAsDataUrl = file => new Promise(async (resolve, reject) => {
+  try {
+    if (!file) return reject(new Error('Please select a payment screenshot.'));
+    const detectedType = normalizeImageType(file.type) || inferImageTypeFromName(file.name);
+    if (!detectedType) return reject(new Error('Please upload a JPG, PNG, WEBP, HEIC, or HEIF image.'));
+    const sourceDataUrl = await new Promise((readResolve, readReject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const value = String(reader.result || '');
+        if (!/^data:image\//i.test(value)) return readReject(new Error('Payment screenshot could not be read.'));
+        readResolve(value);
       };
-      while (sizeInBytes() > 5 * 1024 * 1024 && quality > 0.35) {
-        quality *= 0.7;
-        dataUrl = canvas.toDataURL(outputType, quality);
+      reader.onerror = () => readReject(new Error('Payment screenshot could not be read.'));
+      reader.readAsDataURL(file);
+    });
+    const image = new Image();
+    image.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        const maxSide = 2048;
+        const scale = Math.min(1, maxSide / Math.max(image.width, image.height));
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Payment screenshot could not be read.');
+        context.fillStyle = '#ffffff';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const outputType = detectedType === 'image/png' ? 'image/png' : 'image/jpeg';
+        let quality = 0.92;
+        let dataUrl = canvas.toDataURL(outputType, quality);
+        const sizeInBytes = () => {
+          try { return atob((dataUrl.split(',')[1] || '')).length; } catch { return dataUrl.length; }
+        };
+        while (sizeInBytes() > 5 * 1024 * 1024 && quality > 0.35) {
+          quality *= 0.7;
+          dataUrl = canvas.toDataURL(outputType, quality);
+        }
+        if (sizeInBytes() > 5 * 1024 * 1024) throw new Error('Payment proof must be 5 MB or smaller.');
+        resolve(dataUrl);
+      } catch (error) {
+        reject(new Error(error.message || 'Payment screenshot could not be read.'));
       }
-      if (sizeInBytes() > 5 * 1024 * 1024) throw new Error('Payment proof must be 5 MB or smaller.');
-      URL.revokeObjectURL(objectUrl);
-      resolve(dataUrl);
-    } catch (error) {
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error(error.message || 'Payment screenshot could not be read.'));
-    }
-  };
-  image.onerror = () => {
-    URL.revokeObjectURL(objectUrl);
-    reject(new Error('Payment screenshot could not be read.'));
-  };
-  image.src = objectUrl;
+    };
+    image.onerror = () => reject(new Error('Payment screenshot could not be read.'));
+    image.src = sourceDataUrl;
+  } catch (error) {
+    reject(error);
+  }
 });
 let selectedPaymentProofFile = null;
 document.addEventListener('change', event => {
