@@ -12,3 +12,15 @@ body .admin-modal input,body .admin-modal textarea,body .admin-modal select{bord
 @media(max-width:360px){.admin-user-stat-grid{grid-template-columns:1fr}.admin-user-actions .admin-button{min-width:100%;}.admin-detail-two-col{gap:16px}}
 
 .admin-console .admin-table-wrap{border:1px solid #d7dde7;background:#fff}.admin-console .admin-table{border:1px solid #dfe4ec}.admin-console .admin-table th,.admin-console .admin-table td{border-bottom:1px solid #e6eaf0}.admin-console .admin-table th+th,.admin-console .admin-table td+td{border-left:1px solid #eef1f5}.admin-console .admin-search,.admin-console .admin-select,.admin-console input,.admin-console textarea,.admin-console select{border:1px solid #cbd3df;background:#fff;box-shadow:inset 0 1px 2px rgba(23,32,51,.03)}.admin-console .admin-search:focus,.admin-console .admin-select:focus,.admin-console input:focus,.admin-console textarea:focus,.admin-console select:focus{border-color:#a66d00;outline:2px solid #f3dfad;outline-offset:0}
+
+.admin-console{--admin-bg:#f4f7fb;--admin-surface:#ffffff;--admin-card:#fffdf9;--admin-ink:#172033;--admin-muted:#5d6a7b;--admin-line:#e4e9f1;--admin-accent:#b88a2a;--admin-accent-strong:#9b6b17}
+.admin-console .admin-sidebar{background:#fff;border-right:1px solid var(--admin-line);box-shadow:8px 0 20px rgba(23,32,51,.02)}
+.admin-console .admin-nav-link,.admin-console .admin-nav-logout{border-radius:12px;padding:11px 13px}
+.admin-console .admin-nav-link:hover,.admin-console .admin-nav-link.active{background:#fff5d9;color:var(--admin-accent-strong);box-shadow:inset 0 0 0 1px rgba(184,138,42,.12)}
+.admin-console .admin-topbar{background:rgba(255,255,255,.96);backdrop-filter:blur(10px)}
+.admin-console .admin-panel,.admin-console .admin-metric,.admin-console .admin-card{border:1px solid var(--admin-line);background:var(--admin-card);box-shadow:0 12px 28px rgba(15,23,42,.04)}
+.admin-console .admin-button.primary,.admin-console .admin-button.submit{background:linear-gradient(135deg,#191f2b,#2d374a);color:#fff;border-radius:12px;box-shadow:0 12px 22px rgba(25,31,43,.12)}
+.admin-console .admin-button.secondary{background:#fff;border:1px solid var(--admin-line);color:var(--admin-ink);border-radius:12px}
+.admin-console .admin-row strong,.admin-console .admin-panel h3,.admin-console .admin-title{color:var(--admin-ink)}
+.admin-console .admin-metric strong{font-family:'Plus Jakarta Sans';letter-spacing:-.04em}
+@media(max-width:900px){.admin-console .admin-sidebar{width:230px}.admin-console .admin-main{margin-left:0}}
