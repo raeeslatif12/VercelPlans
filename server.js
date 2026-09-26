@@ -48,6 +48,27 @@ app.use((req, res, next) => {
 });
 app.use(express.static(path.join(__dirname, 'public')));
 
+const toBusinessDateKey = (value = new Date()) => {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return new Date().toISOString().slice(0, 10);
+  const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const parts = formatter.formatToParts(date);
+  const map = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') map[part.type] = part.value;
+  }
+  return `${map.year}-${map.month}-${map.day}`;
+};
+
+const calendarDayDifference = (startKey, endKey) => {
+  const toUtcDate = key => {
+    const [year, month, day] = String(key || '').split('-').map(Number);
+    if (!year || !month || !day) return new Date();
+    return new Date(Date.UTC(year, month - 1, day));
+  };
+  return Math.floor((toUtcDate(endKey).getTime() - toUtcDate(startKey).getTime()) / 86400000);
+};
+
 const normalizeOrigin = value => {
   try {
     const parsed = new URL(String(value || '').trim());
@@ -200,24 +221,25 @@ const reconcileReferralAggregates = async () => {
   `);
 };
 
-const creditPlanProfit = async (client, order, profitDate = new Date().toISOString().slice(0, 10), amountOverride = null) => {
+const creditPlanProfit = async (client, order, profitDate = toBusinessDateKey(new Date()), amountOverride = null) => {
+  const normalizedProfitDate = toBusinessDateKey(profitDate);
   const profitAmount = Number(amountOverride ?? Number(order.daily_return || 0) ?? 0);
   if (!profitAmount || !Number.isFinite(profitAmount)) return { inserted: false, amount: 0 };
 
   const existing = await client.query(
     'SELECT id FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND profit_date = $3',
-    [order.user_id, order.id, profitDate]
+    [order.user_id, order.id, normalizedProfitDate]
   );
   if (existing.rowCount) return { inserted: false, amount: profitAmount };
 
   const inserted = await client.query(
     'INSERT INTO plan_daily_profits(user_id, order_id, plan_id, profit_date, profit_amount, status) VALUES($1,$2,$3,$4,$5,\'posted\') ON CONFLICT(user_id, order_id, profit_date) DO NOTHING RETURNING id',
-    [order.user_id, order.id, order.plan_id, profitDate, profitAmount]
+    [order.user_id, order.id, order.plan_id, normalizedProfitDate, profitAmount]
   );
 
   if (!inserted.rowCount) return { inserted: false, amount: profitAmount };
 
-  const reference = `plan_profit:${order.id}:${profitDate}`;
+  const reference = `plan_profit:${order.id}:${normalizedProfitDate}`;
   await client.query('UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE id = $2', [profitAmount, order.user_id]);
   await createLedgerEntry(client, order.user_id, profitAmount, 'credit', 'daily_plan_profit', reference, { order_id: order.id, plan_id: order.plan_id, profit_date: profitDate, amount: profitAmount });
   await createUserNotification(client, order.user_id, {
@@ -249,7 +271,7 @@ const buildUserPlanSummary = async (userId, now = new Date()) => {
     const startDate = order.activated_at ? new Date(order.activated_at) : new Date(order.created_at);
     const durationDays = Number(order.duration_days || 0);
     const totalDurationMs = durationDays * 24 * 60 * 60 * 1000;
-    const elapsedDays = Math.max(0, Math.min(durationDays, Math.floor((now.getTime() - startDate.getTime()) / (24 * 60 * 60 * 1000))));
+    const elapsedDays = Math.max(0, Math.min(durationDays, calendarDayDifference(toBusinessDateKey(startDate), toBusinessDateKey(now)) + 1));
     const isStillActive = elapsedDays < durationDays && durationDays > 0;
 
     if (!isStillActive) continue;
@@ -548,8 +570,10 @@ const calculatePlanValues = ({ investment, rate, durationDays }) => {
 
 const validatePaymentProof = value => {
   const proof = String(value || '');
-  const match = proof.match(/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/i);
-  if (!match) throw Object.assign(new Error('Payment proof must be a PNG, JPEG, or WEBP image.'), { status: 400 });
+  const match = proof.match(/^data:(image\/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=]+)$/i);
+  if (!match) throw Object.assign(new Error('Payment proof must be a PNG, JPG, JPEG, or WEBP image.'), { status: 400 });
+  const mimeType = match[1].toLowerCase();
+  const normalizedMimeType = mimeType === 'image/jpg' ? 'image/jpeg' : mimeType;
   let bytes;
   try { bytes = Buffer.from(match[2], 'base64'); } catch { throw Object.assign(new Error('Payment proof is not valid base64.'), { status: 400 }); }
   if (!bytes.length || bytes.length > 5 * 1024 * 1024) throw Object.assign(new Error('Payment proof must be between 1 byte and 5 MB.'), { status: 400 });
@@ -558,7 +582,7 @@ const validatePaymentProof = value => {
     'image/jpeg': bytes.subarray(0, 3).equals(Buffer.from([255, 216, 255])),
     'image/webp': bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP',
   };
-  if (!signatures[match[1].toLowerCase()]) throw Object.assign(new Error('Payment proof image signature is invalid.'), { status: 400 });
+  if (!signatures[normalizedMimeType]) throw Object.assign(new Error('Payment proof image signature is invalid.'), { status: 400 });
   return proof;
 };
 
@@ -588,7 +612,7 @@ const processDailyPlanProfits = async (targetDate = new Date()) => {
   if (!enabled) return { processed: 0, total: 0 };
 
   const today = new Date(targetDate);
-  const dateString = today.toISOString().slice(0, 10);
+  const dateString = toBusinessDateKey(today);
   const orders = await query(`
     SELECT o.id, o.user_id, o.plan_id, o.activated_at, o.created_at, o.active, p.daily_return, p.duration_days
     FROM orders o
@@ -601,11 +625,14 @@ const processDailyPlanProfits = async (targetDate = new Date()) => {
 
   for (const order of orders.rows) {
     const activatedAt = order.activated_at ? new Date(order.activated_at) : new Date(order.created_at);
-    const elapsedDays = Math.max(0, Math.floor((today.getTime() - activatedAt.getTime()) / 86400000));
-    if (elapsedDays >= Number(order.duration_days)) {
+    const eligibleDayNumber = calendarDayDifference(toBusinessDateKey(activatedAt), dateString) + 1;
+    const durationDays = Number(order.duration_days || 0);
+    if (eligibleDayNumber > durationDays) {
       await query('UPDATE orders SET active = false, status = CASE WHEN status = \'Approved\' THEN \'Completed\' ELSE status END, updated_at = NOW() WHERE id = $1', [order.id]);
       continue;
     }
+
+    if (eligibleDayNumber <= 0) continue;
 
     const existing = await query('SELECT id FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND profit_date = $3', [order.user_id, order.id, dateString]);
     if (existing.rowCount) continue;
@@ -1160,7 +1187,7 @@ app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
     if (nextStatus === 'Approved') await rewardReferralForApprovedOrder(client, req.params.id, currentOrder.rows[0].user_id);
     if (nextStatus === 'Approved' && currentOrder.rows[0].status !== 'Approved' && await readSetting('daily_profit_enabled', true)) {
       const plan = await client.query('SELECT daily_return FROM plans WHERE id = $1', [currentOrder.rows[0].plan_id]);
-      const profitDate = new Date().toISOString().slice(0, 10);
+      const profitDate = toBusinessDateKey(new Date());
       const existingProfit = await client.query('SELECT id FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND profit_date = $3', [currentOrder.rows[0].user_id, currentOrder.rows[0].id, profitDate]);
       if (!existingProfit.rowCount) {
         await creditPlanProfit(client, {
