@@ -1,3 +1,36 @@
+const paymentProofUploadFailedMessage = 'Payment proof upload failed. Please try again.';
+
+const normalizeImageType = fileType => {
+  const normalized = String(fileType || '').trim().toLowerCase();
+  if (!normalized) return '';
+  if (normalized === 'image/jpg') return 'image/jpeg';
+  if (normalized === 'image/heic' || normalized === 'image/heif') return 'image/jpeg';
+  if (['image/jpeg', 'image/png', 'image/webp'].includes(normalized)) return normalized;
+  return '';
+};
+
+const inferImageTypeFromName = fileName => {
+  const ext = String(fileName || '').split('.').pop()?.toLowerCase();
+  if (['jpg', 'jpeg'].includes(ext)) return 'image/jpeg';
+  if (ext === 'png') return 'image/png';
+  if (ext === 'webp') return 'image/webp';
+  if (['heic', 'heif'].includes(ext)) return 'image/jpeg';
+  return '';
+};
+
+const normalizePaymentProofError = message => {
+  const normalized = String(message || '');
+  return [
+    'Payment screenshot could not be read.',
+    'The payment screenshot could not be read.',
+    paymentProofUploadFailedMessage,
+  ].includes(normalized)
+    ? paymentProofUploadFailedMessage
+    : normalized;
+};
+
+const isSupportedImageType = fileType => Boolean(normalizeImageType(fileType) || inferImageTypeFromName(fileType));
+
 const checkoutToast = message => {
   const box = document.querySelector('#toast');
   if (!box) return;
@@ -6,18 +39,77 @@ const checkoutToast = message => {
 };
 
 const imageDataUrl = file => new Promise((resolve, reject) => {
-  if (!file || !/^image\/(jpeg|png|webp)$/i.test(file.type)) {
-    reject(new Error('Please upload a JPG, PNG, or WEBP image.'));
-    return;
+  if (!file) return reject(new Error('Please select a payment screenshot.'));
+  const detectedType = normalizeImageType(file.type) || inferImageTypeFromName(file.name);
+  if (!detectedType) return reject(new Error('Please upload a JPG, PNG, or WEBP image.'));
+  const sourceType = detectedType === 'image/png' ? 'image/png' : 'image/jpeg';
+  const fileHasMobileFormat = /(heic|heif)/i.test(String(file.type || file.name || ''));
+  const objectUrl = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    try {
+      const canvas = document.createElement('canvas');
+      const maxSide = 2048;
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Payment screenshot could not be read.');
+      context.fillStyle = '#ffffff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(img, 0, 0, canvas.width, canvas.height);
+      let quality = 0.9;
+      let dataUrl = canvas.toDataURL(sourceType, quality);
+      let atobSize = () => {
+        try { return atob(dataUrl.split(',')[1] || '').length; } catch { return dataUrl.length; }
+      };
+      while (atobSize() > 5 * 1024 * 1024 && quality > 0.35) {
+        quality *= 0.7;
+        dataUrl = canvas.toDataURL(sourceType, quality);
+      }
+      if (atobSize() > 5 * 1024 * 1024) {
+        throw new Error('Payment proof must be 5 MB or smaller.');
+      }
+      URL.revokeObjectURL(objectUrl);
+      resolve(dataUrl);
+    } catch (error) {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error(error.message || paymentProofUploadFailedMessage));
+    }
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(objectUrl);
+    reject(new Error('Payment screenshot could not be read.'));
+  };
+  img.src = objectUrl;
+});
+
+let selectedPaymentProofFile = null;
+document.addEventListener('change', event => {
+  const input = event.target.closest('input[name="paymentProof"]');
+  if (!input) return;
+  const file = input.files && input.files[0];
+  selectedPaymentProofFile = file || null;
+  const form = input.closest('form');
+  const nameNode = form?.querySelector('[data-payment-proof-name]');
+  const previewNode = form?.querySelector('[data-payment-proof-preview]');
+  if (file) {
+    if (nameNode) nameNode.textContent = file.name;
+    if (previewNode && previewNode.querySelector('img')) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        previewNode.hidden = false;
+        previewNode.querySelector('img').src = String(reader.result);
+      };
+      reader.onerror = () => {
+        previewNode.hidden = true;
+      };
+      reader.readAsDataURL(file);
+    }
+  } else if (nameNode) {
+    nameNode.textContent = 'No file selected';
+    if (previewNode) previewNode.hidden = true;
   }
-  if (file.size > 5 * 1024 * 1024) {
-    reject(new Error('Payment proof must be 5 MB or smaller.'));
-    return;
-  }
-  const reader = new FileReader();
-  reader.onload = () => resolve(String(reader.result));
-  reader.onerror = () => reject(new Error('Payment proof upload failed. Please try again.'));
-  reader.readAsDataURL(file);
 });
 
 document.addEventListener('click', event => {
@@ -32,7 +124,7 @@ document.addEventListener('submit', async event => {
   if (form.dataset.form !== 'order') return;
   event.preventDefault();
   event.stopImmediatePropagation();
-  const file = form.querySelector('input[name="paymentProof"]')?.files[0];
+  const file = selectedPaymentProofFile || form.querySelector('input[name="paymentProof"]')?.files[0];
   if (!file) return checkoutToast('Please upload your payment screenshot.');
   try {
     const data = Object.fromEntries(new FormData(form));
@@ -44,6 +136,6 @@ document.addEventListener('submit', async event => {
     window.history.pushState({}, '', '/orders');
     window.location.reload();
   } catch (error) {
-    checkoutToast(error.message === 'The payment screenshot could not be read.' ? 'Payment proof upload failed. Please try again.' : error.message);
+    checkoutToast(normalizePaymentProofError(error.message));
   }
 }, true);
