@@ -214,29 +214,32 @@ let currentUser;
 const render = async () => { const path = location.pathname; if (path === '/admin-dashboard') return; const privatePath = ['/dashboard','/tasks','/refer','/withdraw','/history','/profile','/plans','/orders','/notifications','/admin'].some(prefix => path.startsWith(prefix)); if (!privatePath) { app.innerHTML = path === '/login' ? authPage(false) : path === '/register' ? authPage(true) : publicPage(); bind(); return; } app.innerHTML = loadingView('page'); try { currentUser = (await api('/session')).user; if (notificationOwnerId !== currentUser.id) { notificationOwnerId = currentUser.id; knownNotificationIds.clear(); } const notifications = await loadNotifications({ showNew: path !== '/notifications' }); if (path === '/dashboard') { const dashboardData = await api('/dashboard'); app.innerHTML = dashboard(dashboardData); } else if (path === '/tasks') app.innerHTML = tasks(await api('/tasks')); else if (path === '/refer') { const referrals = await api('/referrals'); app.innerHTML = refer({ user: currentUser, referrals }); } else if (path === '/withdraw') app.innerHTML = withdraw(currentUser); else if (path === '/history') app.innerHTML = historyPage((await api('/withdrawals')).withdrawals); else if (path === '/notifications') app.innerHTML = notificationsPage(notifications); else if (path === '/profile') app.innerHTML = profile(currentUser); else if (path === '/plans') app.innerHTML = plansPage((await api('/plans')).plans); else if (path.startsWith('/plans/')) app.innerHTML = planDetails(await api(`/plans/${path.split('/')[2]}`)); else if (path === '/orders') app.innerHTML = ordersPage((await api('/orders')).orders); } catch (error) { window.history.pushState({}, '', '/login'); app.innerHTML = authPage(false); toast(error.message); } bind(); };
 const bind = () => { document.querySelectorAll('a[href^="/"]').forEach(link => link.addEventListener('click', event => { event.preventDefault(); window.history.pushState({}, '', link.getAttribute('href')); render(); })); document.querySelector('.menu-button')?.addEventListener('click', () => document.querySelector('.app-nav').classList.toggle('open')); document.querySelector('.profile-avatar')?.addEventListener('click', () => document.querySelector('.profile-menu').classList.toggle('open')); const toggleButton = document.querySelector('[data-action="toggle-bottom-nav-menu"]'); const bottomNavMenu = document.getElementById('bottom-nav-menu'); if (toggleButton && bottomNavMenu) { toggleButton.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); const willOpen = toggleButton.getAttribute('aria-expanded') !== 'true'; toggleButton.setAttribute('aria-expanded', String(willOpen)); bottomNavMenu.hidden = !willOpen; }); }
 
-  document.addEventListener('click', event => {
-    const toggle = event.target.closest('[data-action="toggle-bottom-nav-menu"]');
-    if (toggle) {
-      event.preventDefault();
-      event.stopPropagation();
-      const menu = document.getElementById('bottom-nav-menu');
-      if (!menu) return;
-      const willOpen = toggle.getAttribute('aria-expanded') !== 'true';
-      toggle.setAttribute('aria-expanded', String(willOpen));
-      menu.hidden = !willOpen;
-      return;
-    }
+  if (!document.body.dataset.globalUiBound) {
+    document.body.dataset.globalUiBound = 'true';
+    document.addEventListener('click', event => {
+      const toggle = event.target.closest('[data-action="toggle-bottom-nav-menu"]');
+      if (toggle) {
+        event.preventDefault();
+        event.stopPropagation();
+        const menu = document.getElementById('bottom-nav-menu');
+        if (!menu) return;
+        const willOpen = toggle.getAttribute('aria-expanded') !== 'true';
+        toggle.setAttribute('aria-expanded', String(willOpen));
+        menu.hidden = !willOpen;
+        return;
+      }
 
-    const paymentChoice = event.target.closest('[data-payment-id]');
-    if (paymentChoice) {
-      const form = paymentChoice.closest('form');
-      const selectedButtons = form ? form.querySelectorAll('[data-payment-id].selected') : document.querySelectorAll('[data-payment-id].selected');
-      selectedButtons.forEach(button => button.classList.remove('selected'));
-      paymentChoice.classList.add('selected');
-      const instructions = form?.querySelector('[data-payment-instructions]');
-      if (instructions) instructions.textContent = paymentChoice.dataset.paymentDetails || 'Payment instructions are not configured yet.';
-    }
-  });
+      const paymentChoice = event.target.closest('[data-payment-id]');
+      if (paymentChoice) {
+        const form = paymentChoice.closest('form');
+        const selectedButtons = form ? form.querySelectorAll('[data-payment-id].selected') : document.querySelectorAll('[data-payment-id].selected');
+        selectedButtons.forEach(button => button.classList.remove('selected'));
+        paymentChoice.classList.add('selected');
+        const instructions = form?.querySelector('[data-payment-instructions]');
+        if (instructions) instructions.textContent = paymentChoice.dataset.paymentDetails || 'Payment instructions are not configured yet.';
+      }
+    });
+  }
 
   const withdrawAmountInput = document.querySelector('[data-withdraw-amount]'); const withdrawPreview = document.querySelector('[data-withdraw-preview]'); if (withdrawAmountInput && withdrawPreview) { const availableBalance = Number(document.querySelector('[data-available-balance]')?.dataset.availableBalance || currentUser?.balance || 0); const updateWithdrawPreview = () => { const rawValue = withdrawAmountInput.value; if (rawValue === '') { withdrawPreview.classList.remove('warning'); withdrawPreview.textContent = `Remaining balance: ${money(availableBalance)}`; return; } const amount = Number(rawValue); if (!Number.isFinite(amount) || amount < 0) { withdrawPreview.classList.add('warning'); withdrawPreview.textContent = 'Invalid amount'; return; } if (amount === 0) { withdrawPreview.classList.remove('warning'); withdrawPreview.textContent = `Remaining balance: ${money(availableBalance)}`; return; } if (amount > availableBalance) { withdrawPreview.classList.add('warning'); withdrawPreview.textContent = 'Insufficient balance'; return; } withdrawPreview.classList.remove('warning'); withdrawPreview.textContent = `Remaining balance: ${money(availableBalance - amount)}`; }; withdrawAmountInput.addEventListener('input', updateWithdrawPreview); withdrawAmountInput.addEventListener('change', updateWithdrawPreview); updateWithdrawPreview(); } document.querySelectorAll('[data-action="logout"]').forEach(btn => btn.addEventListener('click', async event => { event.preventDefault(); await api('/logout',{method:'POST'}); window.history.pushState({},'', '/'); render(); })); document.querySelectorAll('[data-action="rate-task"]').forEach(btn => btn.addEventListener('click', async () => { if (btn.disabled) return; btn.disabled = true; btn.innerHTML = '<span class="button-spinner" aria-hidden="true"></span><span>Rating</span>'; try { const result = await api(`/tasks/${btn.dataset.taskId}/complete`, { method:'POST' }); const card = btn.closest('.task-card'); const summary = document.querySelector('.task-summary'); const progressLabel = summary?.querySelector('.task-summary-row strong'); const progressBar = summary?.querySelector('.progress i'); const taskCount = Number(progressLabel?.textContent.split('/')[1] || 0); const progress = Number(result.progress || 0); btn.outerHTML = '<span class="task-status">Rated</span>'; card?.classList.add('is-complete'); if (progressLabel) progressLabel.textContent = `${progress}/${taskCount}`; if (progressBar && taskCount) progressBar.style.width = `${Math.round((progress / taskCount) * 100)}%`; if (result.completed) { summary?.querySelector('.task-reward-note')?.remove(); summary?.insertAdjacentHTML('beforeend', '<div class="notice">✓ All tasks complete. Your daily reward has been credited.</div>'); } if (result.notification) showEarningNotification(result.notification); if (result.reward) toast(`Daily reward credited: ${money(result.reward)}`); } catch (error) { btn.disabled = false; btn.textContent = 'Rate'; toast(error.message); } })); document.querySelector('[data-action="copy-ref"]')?.addEventListener('click', () => toast('Referral link copied.')); document.querySelectorAll('.wallet').forEach(btn => btn.addEventListener('click', () => { document.querySelectorAll('.wallet').forEach(item => item.classList.remove('selected')); btn.classList.add('selected'); })); document.querySelectorAll('[data-admin]').forEach(btn => btn.addEventListener('click', adminAction)); document.querySelectorAll('form').forEach(form => form.addEventListener('submit', submitForm)); };
 const adminAction = async event => { const button = event.currentTarget; const id = button.dataset.id; try { if (button.dataset.admin === 'toggle-plan') await api(`/admin/plans/${id}`,{method:'PATCH',body:JSON.stringify({active:button.dataset.active !== 'true'})}); if (button.dataset.admin === 'delete-plan') await api(`/admin/plans/${id}`,{method:'DELETE'}); if (button.dataset.admin === 'toggle-method') await api(`/admin/payment-methods/${id}`,{method:'PATCH',body:JSON.stringify({enabled:button.dataset.enabled !== 'true'})}); if (button.dataset.admin === 'delete-method') await api(`/admin/payment-methods/${id}`,{method:'DELETE'}); if (button.dataset.admin === 'save-order') await api(`/admin/orders/${id}`,{method:'PATCH',body:JSON.stringify({status:document.querySelector(`[data-order-status="${id}"]`).value})}); if (button.dataset.admin === 'save-withdrawal') await api(`/admin/withdrawals/${id}`,{method:'PATCH',body:JSON.stringify({status:document.querySelector(`[data-withdraw-status="${id}"]`).value})}); toast('Admin change saved.'); renderAdmin(); } catch (error) { toast(error.message); } };
