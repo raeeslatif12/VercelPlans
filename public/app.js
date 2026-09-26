@@ -3,6 +3,11 @@ const toast = message => { const box = document.querySelector('#toast'); if (!bo
 const api = async (path, options = {}) => { const response = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json' }, ...options }); const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || 'Something went wrong.'); return data; };
 const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#039;' }[char]));
 const money = value => `PKR ${Number(value || 0).toLocaleString()}`;
+const formatPlanTimestamp = (value, options = {}) => {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Unavailable';
+  return new Intl.DateTimeFormat('en-PK', { timeZone: 'Asia/Karachi', ...options }).format(date);
+};
 const formatNotificationDate = value => {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return 'Just now';
@@ -147,9 +152,10 @@ const dashboard = data => {
               <div class="progress-track"><span style="width:${progress}%"></span></div>
             </div>
             <div class="plan-footer-meta">
-              <span>Start: <strong>${new Date(plan.start_date).toLocaleDateString()}</strong></span>
-              <span>End: <strong>${new Date(plan.end_date).toLocaleDateString()}</strong></span>
+              <span>Start: <strong>${esc(formatPlanTimestamp(plan.start_date, { dateStyle: 'medium' }))}</strong></span>
+              <span>End: <strong>${esc(formatPlanTimestamp(plan.end_date, { dateStyle: 'medium' }))}</strong></span>
               <span>Remaining: <strong>${plan.days_remaining} days</strong></span>
+              <span>Next payout: <strong>${plan.next_payout_at ? esc(formatPlanTimestamp(plan.next_payout_at, { dateStyle: 'medium', timeStyle: 'short' })) : 'Not scheduled'}</strong></span>
             </div>
           </div>
         `;
@@ -481,5 +487,21 @@ const fillReferralFromUrl = () => { const field = document.querySelector('input[
 const preserveReferral = () => { const referral = referralFromUrl(); if (referral && location.pathname === '/register') history.replaceState({}, '', `/register?ref=${encodeURIComponent(referral)}`); };
 const route = () => { if (location.pathname === '/admin') history.replaceState({}, '', '/admin-dashboard'); return location.pathname; };
 window.addEventListener('popstate', () => { const path = route(); preserveReferral(); if (path !== '/admin-dashboard') render().then(fillReferralFromUrl); });
-if (route() !== '/admin-dashboard') render().then(() => { preserveReferral(); fillReferralFromUrl(); });
+if (route() !== '/admin-dashboard') {
+  render().then(() => { preserveReferral(); fillReferralFromUrl(); });
+  let dashboardRefreshInProgress = false;
+  setInterval(async () => {
+    if (location.pathname !== '/dashboard' || dashboardRefreshInProgress || document.visibilityState === 'hidden') return;
+    dashboardRefreshInProgress = true;
+    try {
+      const data = await api('/dashboard');
+      if (location.pathname !== '/dashboard') return;
+      currentUser = data.user;
+      app.innerHTML = dashboard(data);
+      bind();
+    } catch {} finally {
+      dashboardRefreshInProgress = false;
+    }
+  }, 30000);
+}
 

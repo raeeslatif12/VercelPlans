@@ -7,6 +7,7 @@
     "dev": "node server.js",
     "start": "node server.js",
     "db:init": "node db-init.js",
+    "test": "node --test history-page.test.js payment-proof-utils.test.js plan-profits.test.js",
     "test:neon": "node neon-e2e-test.js"
   },
   "dependencies": {

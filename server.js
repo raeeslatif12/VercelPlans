@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import { calendarDayDifference, creditPlanProfit, processDailyPlanProfits, toBusinessDateKey } from './plan-profits.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -47,27 +48,6 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
-
-const toBusinessDateKey = (value = new Date()) => {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return new Date().toISOString().slice(0, 10);
-  const formatter = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Karachi', year: 'numeric', month: '2-digit', day: '2-digit' });
-  const parts = formatter.formatToParts(date);
-  const map = {};
-  for (const part of parts) {
-    if (part.type !== 'literal') map[part.type] = part.value;
-  }
-  return `${map.year}-${map.month}-${map.day}`;
-};
-
-const calendarDayDifference = (startKey, endKey) => {
-  const toUtcDate = key => {
-    const [year, month, day] = String(key || '').split('-').map(Number);
-    if (!year || !month || !day) return new Date();
-    return new Date(Date.UTC(year, month - 1, day));
-  };
-  return Math.floor((toUtcDate(endKey).getTime() - toUtcDate(startKey).getTime()) / 86400000);
-};
 
 const normalizeOrigin = value => {
   try {
@@ -141,6 +121,16 @@ const readSetting = async (name, fallback) => {
   const result = await query('SELECT setting_value FROM app_settings WHERE setting_name = $1', [name]);
   if (!result.rows[0]) return fallback;
   return parseSettingValue(result.rows[0].setting_value, fallback);
+};
+
+const readDailyProfitEnablementHistory = async () => {
+  const result = await query(`
+    SELECT metadata->>'value' AS enabled, created_at
+    FROM admin_audit_log
+    WHERE action = 'settings_updated' AND metadata->>'key' = 'daily_profit_enabled'
+    ORDER BY created_at ASC
+  `);
+  return result.rows;
 };
 
 const writeSetting = async (name, value, actorId = null) => {
@@ -221,40 +211,28 @@ const reconcileReferralAggregates = async () => {
   `);
 };
 
-const creditPlanProfit = async (client, order, profitDate = toBusinessDateKey(new Date()), amountOverride = null) => {
-  const normalizedProfitDate = toBusinessDateKey(profitDate);
-  const profitAmount = Number(amountOverride ?? Number(order.daily_return || 0) ?? 0);
-  if (!profitAmount || !Number.isFinite(profitAmount)) return { inserted: false, amount: 0 };
+const verifiedPlanProfitLedger = `(
+  SELECT COUNT(*)
+  FROM ledger_transactions lt
+  WHERE lt.user_id = pp.user_id
+    AND lt.source = 'daily_plan_profit'
+    AND lt.type = 'credit'
+    AND lt.status = 'posted'
+    AND lt.amount = pp.profit_amount
+    AND (
+      lt.reference = 'plan_profit:' || pp.order_id::text || ':' || pp.profit_date::text
+      OR (lt.metadata->>'order_id' = pp.order_id::text AND lt.metadata->>'profit_date' = pp.profit_date::text)
+    )
+) = 1`;
 
-  const existing = await client.query(
-    'SELECT id FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND profit_date = $3',
-    [order.user_id, order.id, normalizedProfitDate]
-  );
-  if (existing.rowCount) return { inserted: false, amount: profitAmount };
-
-  const inserted = await client.query(
-    'INSERT INTO plan_daily_profits(user_id, order_id, plan_id, profit_date, profit_amount, status) VALUES($1,$2,$3,$4,$5,\'posted\') ON CONFLICT(user_id, order_id, profit_date) DO NOTHING RETURNING id',
-    [order.user_id, order.id, order.plan_id, normalizedProfitDate, profitAmount]
-  );
-
-  if (!inserted.rowCount) return { inserted: false, amount: profitAmount };
-
-  const reference = `plan_profit:${order.id}:${normalizedProfitDate}`;
-  await client.query('UPDATE users SET balance = balance + $1, updated_at = NOW() WHERE id = $2', [profitAmount, order.user_id]);
-  await createLedgerEntry(client, order.user_id, profitAmount, 'credit', 'daily_plan_profit', reference, { order_id: order.id, plan_id: order.plan_id, profit_date: profitDate, amount: profitAmount });
-  await createUserNotification(client, order.user_id, {
-    title: 'Congratulations!',
-    message: 'Plan earning credited successfully.',
-    amount: profitAmount,
-    reason: 'Plan earning',
-    source: 'daily_plan_profit',
-    reference,
-    metadata: { order_id: order.id, plan_id: order.plan_id, profit_date: profitDate, amount: profitAmount },
-  });
-  return { inserted: true, amount: profitAmount };
+const nextScheduledPayoutAt = now => {
+  const currentTime = new Date(now);
+  const currentUtcMidnight = Date.UTC(currentTime.getUTCFullYear(), currentTime.getUTCMonth(), currentTime.getUTCDate());
+  const nextCycle = currentUtcMidnight > currentTime.getTime() ? currentUtcMidnight : currentUtcMidnight + 86400000;
+  return new Date(nextCycle).toISOString();
 };
 
-const buildUserPlanSummary = async (userId, now = new Date()) => {
+const buildUserPlanSummary = async (userId, now, dailyProfitEnabled) => {
   const activeOrders = await query(`
     SELECT o.*, p.name, p.investment, p.daily_return, p.duration_days, p.total_return
     FROM orders o
@@ -277,7 +255,9 @@ const buildUserPlanSummary = async (userId, now = new Date()) => {
     if (!isStillActive) continue;
 
     const earnedResult = await query(
-      'SELECT COALESCE(SUM(profit_amount), 0) AS earned_amount, COUNT(*)::int AS credited_days FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND status = \'posted\'',
+      `SELECT COALESCE(SUM(pp.profit_amount), 0) AS earned_amount, COUNT(*)::int AS credited_days
+       FROM plan_daily_profits pp
+       WHERE pp.user_id = $1 AND pp.order_id = $2 AND pp.status = 'posted' AND ${verifiedPlanProfitLedger}`,
       [userId, order.id]
     );
 
@@ -301,6 +281,7 @@ const buildUserPlanSummary = async (userId, now = new Date()) => {
       progress_percent: progressPercent,
       start_date: startDate.toISOString(),
       end_date: new Date(startDate.getTime() + totalDurationMs).toISOString(),
+      next_payout_at: dailyProfitEnabled && remainingDays > 0 ? nextScheduledPayoutAt(now) : null,
       status: 'Active',
       is_active: true,
     });
@@ -309,7 +290,7 @@ const buildUserPlanSummary = async (userId, now = new Date()) => {
   return results;
 };
 
-const buildUserDashboardData = async userId => {
+const buildUserDashboardData = async (userId, now, dailyProfitEnabled) => {
   const pendingOrder = await query(`
     SELECT o.id, o.status, o.created_at, o.active, p.name, p.investment, p.duration_days, p.daily_return
     FROM orders o
@@ -319,7 +300,7 @@ const buildUserDashboardData = async userId => {
     LIMIT 1
   `, [userId]);
 
-  const activePlans = await buildUserPlanSummary(userId);
+  const activePlans = await buildUserPlanSummary(userId, now, dailyProfitEnabled);
   return {
     activePlans,
     pendingOrder: pendingOrder.rows[0] ? {
@@ -419,6 +400,31 @@ const createUserNotification = async (client, userId, { title, message, amount =
     [userId, title || 'Congratulations!', message || 'Your balance has been updated.', Number(amount || 0), String(reason || ''), String(source), String(reference), JSON.stringify(metadata || {})]
   );
   return result.rowCount ? result.rows[0] : null;
+};
+
+const creditPlanProfitForOrder = (client, order, profitDate, catchUp = false, amountOverride = null) => creditPlanProfit(
+  client,
+  order,
+  profitDate,
+  {
+    createLedgerEntry,
+    createUserNotification,
+    createPlanProfitAudit: (db, userId, action, metadata) => insertAuditLogWithClient(db, null, userId, action, metadata),
+  },
+  amountOverride,
+  catchUp
+);
+
+const runDailyPlanProfits = async () => {
+  const result = await processDailyPlanProfits({
+    query,
+    connect: () => pool.connect(),
+    readSetting,
+    readEnablementHistory: readDailyProfitEnablementHistory,
+    creditProfit: creditPlanProfitForOrder,
+  });
+  if (result.needsReview.length) console.warn('Plan profit reconciliation needs admin review:', JSON.stringify(result.needsReview));
+  return result;
 };
 
 const rewardReferralForApprovedOrder = async (client, orderId, referredUserId) => {
@@ -623,72 +629,6 @@ const ensureUserDailyTasks = async userId => {
   return refreshed.rows;
 };
 
-const processDailyPlanProfits = async (targetDate = new Date()) => {
-  const enabled = await readSetting('daily_profit_enabled', true);
-  if (!enabled) return { processed: 0, total: 0 };
-
-  const today = new Date(targetDate);
-  const dateString = toBusinessDateKey(today);
-  const orders = await query(`
-    SELECT o.id, o.user_id, o.plan_id, o.activated_at, o.created_at, o.active, p.daily_return, p.duration_days
-    FROM orders o
-    JOIN plans p ON p.id = o.plan_id
-    WHERE o.status = 'Approved' AND o.active = true AND p.active = true
-  `);
-
-  let processed = 0;
-  let total = 0;
-
-  for (const order of orders.rows) {
-    const activatedAt = order.activated_at ? new Date(order.activated_at) : new Date(order.created_at);
-    const eligibleDayNumber = calendarDayDifference(toBusinessDateKey(activatedAt), dateString) + 1;
-    const durationDays = Number(order.duration_days || 0);
-    if (eligibleDayNumber > durationDays) {
-      await query('UPDATE orders SET active = false, status = CASE WHEN status = \'Approved\' THEN \'Completed\' ELSE status END, updated_at = NOW() WHERE id = $1', [order.id]);
-      continue;
-    }
-
-    if (eligibleDayNumber <= 0) continue;
-
-    const existing = await query('SELECT id FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND profit_date = $3', [order.user_id, order.id, dateString]);
-    if (existing.rowCount) continue;
-
-    const profitAmount = Number(order.daily_return || 0);
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const inserted = await client.query(
-        'INSERT INTO plan_daily_profits(user_id, order_id, plan_id, profit_date, profit_amount, status) VALUES($1,$2,$3,$4,$5,\'posted\') ON CONFLICT(user_id, order_id, profit_date) DO NOTHING RETURNING id',
-        [order.user_id, order.id, order.plan_id, dateString, profitAmount]
-      );
-      if (inserted.rowCount) {
-        const profitReference = `plan_profit:${order.id}:${dateString}`;
-        await client.query('UPDATE users SET balance = balance + $1 WHERE id = $2', [profitAmount, order.user_id]);
-        await createLedgerEntry(client, order.user_id, profitAmount, 'credit', 'daily_plan_profit', profitReference, { order_id: order.id, plan_id: order.plan_id, profit_date: dateString, amount: profitAmount });
-        await createUserNotification(client, order.user_id, {
-          title: 'Congratulations!',
-          message: 'Plan earning credited successfully.',
-          amount: profitAmount,
-          reason: 'Plan earning',
-          source: 'daily_plan_profit',
-          reference: profitReference,
-          metadata: { order_id: order.id, plan_id: order.plan_id, profit_date: dateString, amount: profitAmount },
-        });
-        processed += 1;
-        total += profitAmount;
-      }
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
-  return { processed, total };
-};
-
 app.get('/api/session', auth, async (req, res) => {
   const settings = await readAllSettings();
   const referralStats = await getUserReferralStats(req.user.id);
@@ -696,7 +636,9 @@ app.get('/api/session', auth, async (req, res) => {
 });
 
 app.get('/api/dashboard', auth, async (req, res) => {
-  const dashboard = await buildUserDashboardData(req.user.id);
+  const clock = await query('SELECT CURRENT_TIMESTAMP AS now');
+  const dailyProfitEnabled = await readSetting('daily_profit_enabled', true);
+  const dashboard = await buildUserDashboardData(req.user.id, clock.rows[0].now, dailyProfitEnabled);
   const referralStats = await getUserReferralStats(req.user.id);
   res.json({
     user: { ...safeUser(req.user), totalReferrals: referralStats.totalReferrals, referralEarnings: referralStats.referralEarnings },
@@ -1206,16 +1148,13 @@ app.patch('/api/admin/orders/:id', adminAuth, async (req, res) => {
     if (nextStatus === 'Approved') await rewardReferralForApprovedOrder(client, req.params.id, currentOrder.rows[0].user_id);
     if (nextStatus === 'Approved' && currentOrder.rows[0].status !== 'Approved' && await readSetting('daily_profit_enabled', true)) {
       const plan = await client.query('SELECT daily_return FROM plans WHERE id = $1', [currentOrder.rows[0].plan_id]);
-      const profitDate = toBusinessDateKey(new Date());
-      const existingProfit = await client.query('SELECT id FROM plan_daily_profits WHERE user_id = $1 AND order_id = $2 AND profit_date = $3', [currentOrder.rows[0].user_id, currentOrder.rows[0].id, profitDate]);
-      if (!existingProfit.rowCount) {
-        await creditPlanProfit(client, {
-          user_id: currentOrder.rows[0].user_id,
-          id: currentOrder.rows[0].id,
-          plan_id: currentOrder.rows[0].plan_id,
-          daily_return: Number(plan.rows[0]?.daily_return || 0),
-        }, profitDate, Number(plan.rows[0]?.daily_return || 0));
-      }
+      const profitDate = toBusinessDateKey(updated.rows[0].activated_at);
+      await creditPlanProfitForOrder(client, {
+        user_id: currentOrder.rows[0].user_id,
+        id: currentOrder.rows[0].id,
+        plan_id: currentOrder.rows[0].plan_id,
+        daily_return: Number(plan.rows[0]?.daily_return || 0),
+      }, profitDate, false, Number(plan.rows[0]?.daily_return || 0));
     }
     await client.query('COMMIT');
     await insertAuditLog(req.admin.id, currentOrder.rows[0].user_id, 'order_status_updated', { order_id: req.params.id, status: nextStatus, admin_note: adminNote || '' });
@@ -1361,8 +1300,8 @@ app.get('/api/admin/users/:id', adminAuth, async (req, res) => {
 
   const [orders, withdrawals, tasks, referrals, referredBy, ledger, devices, audit] = await Promise.all([
     query(`SELECT o.*, p.name AS plan_name, p.return_rate, p.daily_return, p.duration_days, p.total_return,
-      pm.name AS payment_method, COALESCE((SELECT SUM(profit_amount) FROM plan_daily_profits pp WHERE pp.order_id = o.id AND pp.status = 'posted'), 0)::int AS total_earned,
-      COALESCE((SELECT COUNT(*) FROM plan_daily_profits pp WHERE pp.order_id = o.id AND pp.status = 'posted'), 0)::int AS credited_days
+      pm.name AS payment_method, COALESCE((SELECT SUM(pp.profit_amount) FROM plan_daily_profits pp WHERE pp.order_id = o.id AND pp.status = 'posted' AND ${verifiedPlanProfitLedger}), 0)::int AS total_earned,
+      COALESCE((SELECT COUNT(*) FROM plan_daily_profits pp WHERE pp.order_id = o.id AND pp.status = 'posted' AND ${verifiedPlanProfitLedger}), 0)::int AS credited_days
       FROM orders o JOIN plans p ON p.id = o.plan_id LEFT JOIN payment_methods pm ON pm.id = o.payment_method_id
       WHERE o.user_id = $1 ORDER BY o.created_at DESC`, [userId]),
     query('SELECT * FROM withdrawals WHERE user_id = $1 ORDER BY created_at DESC', [userId]),
@@ -1589,16 +1528,18 @@ app.post('/api/admin/device-exceptions', adminAuth, async (req, res) => {
   res.json({ ok: true, additionalAccounts: extra });
 });
 
-app.post('/api/cron/daily-profit', async (req, res) => {
-  const configuredSecret = String(process.env.VERCEL_CRON_SECRET || '');
+const dailyProfitCron = async (req, res) => {
+  const configuredSecret = String(process.env.VERCEL_CRON_SECRET || process.env.CRON_SECRET || '');
   const secret = String(req.headers['x-vercel-cron-secret'] || req.headers.authorization?.replace(/^Bearer\s+/i, '') || '');
   const secretMatches = secret.length === configuredSecret.length && crypto.timingSafeEqual(Buffer.from(secret), Buffer.from(configuredSecret));
   if (!configuredSecret || !secret || !secretMatches) {
     return res.status(401).json({ error: 'Invalid cron secret.' });
   }
-  const result = await processDailyPlanProfits(new Date());
-  res.json({ ok: true, processed: result.processed, total: result.total });
-});
+  const result = await runDailyPlanProfits();
+  res.json({ ok: true, processed: result.processed, total: result.total, reconciled: result.reconciled, plansChecked: result.plansChecked, needsReview: result.needsReview });
+};
+app.get('/api/cron/daily-profit', dailyProfitCron);
+app.post('/api/cron/daily-profit', dailyProfitCron);
 
 const ensureAdmin = async () => {
   if (!pool || !process.env.ADMIN_PHONE || !process.env.ADMIN_PASSWORD) return;
