@@ -338,6 +338,28 @@ const buildUserDashboardData = async userId => {
 const issueAuth = (res, userId) => res.cookie('vp_token', jwt.sign({ userId }, jwtSecret, { expiresIn: '7d' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 604800000 });
 const issueAdminAuth = (res, userId) => res.cookie('vp_admin_token', jwt.sign({ admin: true, userId }, jwtSecret, { expiresIn: '8h' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 28800000 });
 
+const normalizeDeviceFingerprint = req => {
+  const forwarded = String(req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.ip || req.socket?.remoteAddress || '').split(',')[0].trim();
+  const agent = String(req.headers['user-agent'] || '').trim();
+  const language = String(req.headers['accept-language'] || '').trim();
+  const base = `${forwarded}|${agent}|${language}`;
+  return crypto.createHash('sha256').update(base).digest('hex');
+};
+
+const createDeviceHash = req => {
+  const existing = String(req.cookies?.vp_device_id || '').trim();
+  if (existing && /^[a-f0-9]{64}$/i.test(existing)) return existing;
+  return normalizeDeviceFingerprint(req);
+};
+
+const setDeviceCookie = (req, res, deviceHash) => {
+  const existing = String(req.cookies?.vp_device_id || '').trim();
+  if (existing && existing === deviceHash) return;
+  if (deviceHash) {
+    res.cookie('vp_device_id', deviceHash, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 31536000000 });
+  }
+};
+
 const auth = async (req, res, next) => {
   try {
     const token = req.cookies.vp_token;
@@ -438,12 +460,6 @@ const insertAuditLogWithClient = async (client, actorUserId, targetUserId, actio
     'INSERT INTO admin_audit_log(actor_user_id, target_user_id, action, metadata) VALUES($1,$2,$3,$4::jsonb)',
     [actorUserId || null, targetUserId || null, action, JSON.stringify(metadata || {})]
   );
-};
-
-const createDeviceHash = req => {
-  const userAgent = String(req.headers['user-agent'] || '');
-  const forwarded = String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '');
-  return crypto.createHash('sha256').update(`${userAgent}|${forwarded}`).digest('hex');
 };
 
 const ensureUserHasActivePlan = async userId => {
@@ -704,6 +720,7 @@ app.post('/api/register', async (req, res) => {
     }
     const db = client || { query };
     const deviceHash = createDeviceHash(req);
+    setDeviceCookie(req, res, deviceHash);
     const settings = await readAllSettings();
     if (client) await client.query('BEGIN');
     if (settings.device_restriction_enabled) {
@@ -800,6 +817,8 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'The mobile number or password is incorrect.' });
     }
     clearLoginFailures(attemptKey);
+    const deviceHash = createDeviceHash(req);
+    setDeviceCookie(req, res, deviceHash);
     await query('UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1', [result.rows[0].id]);
     issueAuth(res, result.rows[0].id);
     res.json({ user: safeUser(result.rows[0]) });

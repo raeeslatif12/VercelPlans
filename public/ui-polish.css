@@ -9,7 +9,7 @@ html, body { overflow-x: hidden; }
 .app-nav { display: flex !important; }
 .menu-button { display: none !important; }
 .dashboard-nav { display: none !important; }
-.dashboard-nav-menu[hidden] { display: none !important; }
+.dashboard-nav-menu[hidden], .nav-more-menu[hidden] { display: none !important; }
 .dashboard-nav-icon {
   display: inline-flex;
   align-items: center;
@@ -47,6 +47,7 @@ html, body { overflow-x: hidden; }
     border-top: 1px solid var(--line);
     box-shadow: 0 -10px 24px rgba(15, 23, 42, 0.08);
     backdrop-filter: blur(10px);
+    overflow: visible;
   }
 
   .dashboard-nav a,
@@ -102,6 +103,7 @@ html, body { overflow-x: hidden; }
     position: absolute;
     right: 12px;
     bottom: calc(100% + 10px);
+    z-index: 40;
     display: grid;
     gap: 6px;
     min-width: 180px;

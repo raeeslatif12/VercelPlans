@@ -74,10 +74,31 @@ const navIcon = name => ({
   orders: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 4.5h10l2 4v9.5a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V8.5l2-4Z"/><path d="M9 10h6M9 14h6"/></svg>',
   tasks: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.5v5M8.5 6.5l3.5 3.5 3.5-3.5"/><circle cx="12" cy="14" r="6"/><path d="M12 10v4l2.5 2"/></svg>',
   refer: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 7h10v10H7z"/><path d="M10 14 17 7"/><path d="M14 7h3v3"/></svg>',
+  notifications: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 17h5l-1.4-1.4A2 2 0 0 1 18 14.2V11a6 6 0 1 0-12 0v3.2a2 2 0 0 1-.6 1.4L4 17h5"/><path d="M10 19a2 2 0 0 0 4 0"/></svg>',
   withdraw: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7.5h16v9H4z"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>',
+  history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12a8 8 0 1 0 8-8"/><path d="M4 4v5h5"/><path d="M12 7v5l3 2"/></svg>',
+  profile: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 19a6 6 0 0 0-12 0"/><circle cx="12" cy="8" r="3.5"/></svg>',
   menu: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>',
 }[name] || '');
-const header = auth => auth ? `<header class="app-header"><button class="menu-button" aria-label="Open menu">☰</button><a class="brand" href="/dashboard"><span class="brand-mark">V</span>VercelPlans</a><nav class="app-nav"><div class="nav-links"><a href="/dashboard">Dashboard</a><a href="/plans">Plans</a><a href="/orders">My Orders</a><a href="/tasks">Daily Task</a><a href="/refer">Refer & Earn</a><a href="/notifications">Notifications</a><a href="/withdraw">Withdraw</a></div></nav><div class="profile-menu"><button class="profile-avatar" aria-label="Open profile menu">${avatarInitials(currentUser)}</button><div class="profile-dropdown"><strong class="profile-dropdown-name">${esc(displayName(currentUser))}</strong><a href="/profile">Profile</a><a href="/history">History</a><a href="/notifications">Notifications</a><a href="#logout" data-action="logout">Log out</a></div></div></header>` : `<header class="site-header"><a class="brand" href="/"><span class="brand-mark">V</span>VercelPlans</a><nav class="top-links"><a href="/login">Login</a><a href="/register">Join Free</a></nav></header>`;
+const header = auth => {
+  if (!auth) return `<header class="site-header"><a class="brand" href="/"><span class="brand-mark">V</span>VercelPlans</a><nav class="top-links"><a href="/login">Login</a><a href="/register">Join Free</a></nav></header>`;
+
+  const primaryLinks = [
+    { href: '/dashboard', label: 'Dashboard' },
+    { href: '/plans', label: 'Plans' },
+    { href: '/orders', label: 'My Orders' },
+  ];
+  const moreLinks = [
+    { href: '/tasks', label: 'Daily Task' },
+    { href: '/refer', label: 'Refer & Earn' },
+    { href: '/notifications', label: 'Notifications' },
+    { href: '/withdraw', label: 'Withdraw' },
+    { href: '/history', label: 'History' },
+    { href: '/profile', label: 'Profile' },
+  ];
+
+  return `<header class="app-header"><button class="menu-button" aria-label="Open menu">☰</button><a class="brand" href="/dashboard"><span class="brand-mark">V</span>VercelPlans</a><nav class="app-nav" aria-label="Main navigation"><div class="nav-links">${primaryLinks.map(link => `<a href="${link.href}">${link.label}</a>`).join('')}<div class="nav-more-wrap"><button class="nav-more-toggle" type="button" data-action="toggle-more-menu" aria-expanded="false" aria-controls="nav-more-menu">More</button><div class="nav-more-menu" id="nav-more-menu" hidden role="menu" aria-label="More navigation">${moreLinks.map(link => `<a href="${link.href}" role="menuitem">${link.label}</a>`).join('')}</div></div></div></nav><div class="profile-menu"><button class="profile-avatar" aria-label="Open profile menu">${avatarInitials(currentUser)}</button><div class="profile-dropdown"><strong class="profile-dropdown-name">${esc(displayName(currentUser))}</strong><a href="/profile">Profile</a><a href="/history">History</a><a href="/notifications">Notifications</a><a href="#logout" data-action="logout">Log out</a></div></div></header>`;
+};
 const bottom = path => {
   const items = [
     { href: '/dashboard', label: 'Dashboard', icon: 'dashboard' },
@@ -85,7 +106,10 @@ const bottom = path => {
     { href: '/orders', label: 'My Orders', icon: 'orders' },
     { href: '/tasks', label: 'Daily Task', icon: 'tasks' },
     { href: '/refer', label: 'Refer & Earn', icon: 'refer' },
+    { href: '/notifications', label: 'Notifications', icon: 'notifications' },
     { href: '/withdraw', label: 'Withdraw', icon: 'withdraw' },
+    { href: '/history', label: 'History', icon: 'history' },
+    { href: '/profile', label: 'Profile', icon: 'profile' },
   ];
   const mainItems = items.slice(0, 3);
   const menuItems = items.slice(3);
@@ -212,21 +236,76 @@ const adminLoginPage = () => `<main class="auth-page admin-auth-page"><div class
 const adminData = async () => ({ plans:(await api('/admin/plans')).plans, orders:(await api('/admin/orders')).orders, withdrawals:(await api('/admin/withdrawals')).withdrawals, methods:(await api('/admin/payment-methods')).methods, settings:(await api('/admin/settings')).settings });
 let currentUser;
 const render = async () => { const path = location.pathname; if (path === '/admin-dashboard') return; const privatePath = ['/dashboard','/tasks','/refer','/withdraw','/history','/profile','/plans','/orders','/notifications','/admin'].some(prefix => path.startsWith(prefix)); if (!privatePath) { app.innerHTML = path === '/login' ? authPage(false) : path === '/register' ? authPage(true) : publicPage(); bind(); return; } app.innerHTML = loadingView('page'); try { currentUser = (await api('/session')).user; if (notificationOwnerId !== currentUser.id) { notificationOwnerId = currentUser.id; knownNotificationIds.clear(); } const notifications = await loadNotifications({ showNew: path !== '/notifications' }); if (path === '/dashboard') { const dashboardData = await api('/dashboard'); app.innerHTML = dashboard(dashboardData); } else if (path === '/tasks') app.innerHTML = tasks(await api('/tasks')); else if (path === '/refer') { const referrals = await api('/referrals'); app.innerHTML = refer({ user: currentUser, referrals }); } else if (path === '/withdraw') app.innerHTML = withdraw(currentUser); else if (path === '/history') app.innerHTML = historyPage((await api('/withdrawals')).withdrawals); else if (path === '/notifications') app.innerHTML = notificationsPage(notifications); else if (path === '/profile') app.innerHTML = profile(currentUser); else if (path === '/plans') app.innerHTML = plansPage((await api('/plans')).plans); else if (path.startsWith('/plans/')) app.innerHTML = planDetails(await api(`/plans/${path.split('/')[2]}`)); else if (path === '/orders') app.innerHTML = ordersPage((await api('/orders')).orders); } catch (error) { window.history.pushState({}, '', '/login'); app.innerHTML = authPage(false); toast(error.message); } bind(); };
-const bind = () => { document.querySelectorAll('a[href^="/"]').forEach(link => link.addEventListener('click', event => { event.preventDefault(); window.history.pushState({}, '', link.getAttribute('href')); render(); })); document.querySelector('.menu-button')?.addEventListener('click', () => document.querySelector('.app-nav').classList.toggle('open')); document.querySelector('.profile-avatar')?.addEventListener('click', () => document.querySelector('.profile-menu').classList.toggle('open')); const toggleButton = document.querySelector('[data-action="toggle-bottom-nav-menu"]'); const bottomNavMenu = document.getElementById('bottom-nav-menu'); if (toggleButton && bottomNavMenu) { toggleButton.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); const willOpen = toggleButton.getAttribute('aria-expanded') !== 'true'; toggleButton.setAttribute('aria-expanded', String(willOpen)); bottomNavMenu.hidden = !willOpen; }); }
+const bind = () => {
+  const closeDesktopMoreMenu = () => {
+    const toggle = document.querySelector('[data-action="toggle-more-menu"]');
+    const menu = document.getElementById('nav-more-menu');
+    if (!toggle || !menu) return;
+    toggle.setAttribute('aria-expanded', 'false');
+    menu.hidden = true;
+  };
+
+  const closeMobileMoreMenu = () => {
+    const toggle = document.querySelector('[data-action="toggle-bottom-nav-menu"]');
+    const menu = document.getElementById('bottom-nav-menu');
+    if (!toggle || !menu) return;
+    toggle.setAttribute('aria-expanded', 'false');
+    menu.hidden = true;
+  };
+
+  document.querySelectorAll('a[href^="/"]').forEach(link => link.addEventListener('click', event => {
+    event.preventDefault();
+    const href = link.getAttribute('href');
+    closeDesktopMoreMenu();
+    closeMobileMoreMenu();
+    window.history.pushState({}, '', href);
+    render();
+  }));
+
+  document.querySelector('.menu-button')?.addEventListener('click', () => document.querySelector('.app-nav').classList.toggle('open'));
+  document.querySelector('.profile-avatar')?.addEventListener('click', () => document.querySelector('.profile-menu').classList.toggle('open'));
+
+  const toggleButton = document.querySelector('[data-action="toggle-bottom-nav-menu"]');
+  const bottomNavMenu = document.getElementById('bottom-nav-menu');
+  if (toggleButton && bottomNavMenu) {
+    toggleButton.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const willOpen = toggleButton.getAttribute('aria-expanded') !== 'true';
+      toggleButton.setAttribute('aria-expanded', String(willOpen));
+      bottomNavMenu.hidden = !willOpen;
+      if (willOpen) closeDesktopMoreMenu();
+    });
+  }
+
+  const desktopToggle = document.querySelector('[data-action="toggle-more-menu"]');
+  const desktopMenu = document.getElementById('nav-more-menu');
+  if (desktopToggle && desktopMenu) {
+    desktopToggle.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const willOpen = desktopToggle.getAttribute('aria-expanded') !== 'true';
+      desktopToggle.setAttribute('aria-expanded', String(willOpen));
+      desktopMenu.hidden = !willOpen;
+      if (willOpen) closeMobileMoreMenu();
+    });
+  }
 
   if (!document.body.dataset.globalUiBound) {
     document.body.dataset.globalUiBound = 'true';
     document.addEventListener('click', event => {
-      const toggle = event.target.closest('[data-action="toggle-bottom-nav-menu"]');
-      if (toggle) {
-        event.preventDefault();
-        event.stopPropagation();
-        const menu = document.getElementById('bottom-nav-menu');
-        if (!menu) return;
-        const willOpen = toggle.getAttribute('aria-expanded') !== 'true';
-        toggle.setAttribute('aria-expanded', String(willOpen));
-        menu.hidden = !willOpen;
-        return;
+      const clickedMoreToggle = event.target.closest('[data-action="toggle-more-menu"]');
+      if (clickedMoreToggle) return;
+
+      const clickedBottomToggle = event.target.closest('[data-action="toggle-bottom-nav-menu"]');
+      if (clickedBottomToggle) return;
+
+      if (!event.target.closest('.nav-more-menu') && !event.target.closest('[data-action="toggle-more-menu"]')) {
+        closeDesktopMoreMenu();
+      }
+
+      if (!event.target.closest('.dashboard-nav-menu') && !event.target.closest('[data-action="toggle-bottom-nav-menu"]')) {
+        closeMobileMoreMenu();
       }
 
       const paymentChoice = event.target.closest('[data-payment-id]');
